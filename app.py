@@ -1,13 +1,12 @@
 """
-IDkat: find and fix your personal information online.
+IDkat v2: find and fix your personal information online.
 
-- Sign in with your email: no password. A one-time link is emailed to you with the
-  consent notice.
-- IDkat searches the public web for information about YOU: social media, forums, blogs,
-  people-search sites and other listings.
+- Create a username and password to log in. No email required for sign-up.
+- IDkat searches the public web for information about YOU.
 - Identifiers are matched locally in code to protect user privacy.
 - Results show WHERE information is exposed and HOW to remove it.
 - Reports contain ONLY verified user pages.
+- Downloading your reports permanently purges all account and result data.
 """
 
 import datetime
@@ -18,13 +17,9 @@ import io
 import json
 import re
 import secrets as pysecrets
-import smtplib
-import ssl
 import threading
 import time
 import uuid
-from base64 import urlsafe_b64decode, urlsafe_b64encode
-from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -43,11 +38,7 @@ st.set_page_config(page_title="IDkat", page_icon="🐾", layout="centered")
 # ============================================================================
 DEFAULT_MODEL = "gemini-3.8-flash"
 FALLBACK_MODEL = "gemini-flash-latest"
-LINK_MINUTES = 15
-SESSION_HOURS = 2
 RESULTS_HOURS = 2
-NAME_LOCK_DAYS = 30
-MAX_LINKS_PER_HOUR = 3
 MAX_SCANS_PER_DAY = 2
 INK, BONE, SAND, MUTED = "#14120F", "#F2EDE3", "#C6BCA9", "#8A8275"
 
@@ -96,51 +87,8 @@ PAGE_TYPES = [
     "Other",
 ]
 
-GENERAL_ADVICE = [
-    (
-        "Ask Google to remove results",
-        "Google's 'Results about you' tool (in your Google account) lets you request removal of search results showing your phone number, home address or email address.",
-    ),
-    (
-        "Opt out of people-search sites",
-        "Most people-search and data-broker sites have an opt-out or removal page, often in the site footer. Removal requests may take several weeks, and some sites re-list people later, so check again every few months.",
-    ),
-    (
-        "Tighten your social media settings",
-        "Set profiles to private or friends-only, hide your friends list, turn off being found by phone number or email, and remove location details from old posts.",
-    ),
-    (
-        "Close old accounts",
-        "Delete accounts you no longer use, especially old forums and blogs. Deleting is better than abandoning, because old accounts are often the source of leaked details.",
-    ),
-    (
-        "Ask site owners directly",
-        "For blogs, forums and listings, contact the site owner or moderators and ask for your details to be removed. Keep a record of what you asked and when.",
-    ),
-    (
-        "Protect yourself after data breaches",
-        "If your email appears in a data breach, change that password and any others like it, and turn on multi-factor authentication.",
-    ),
-    (
-        "Get help if you're being targeted",
-        "In Australia, eSafety can help with serious online abuse and image-based abuse, and the OAIC handles privacy complaints about businesses. If you feel unsafe, contact the police.",
-    ),
-]
-
 _SECRET_CACHE = {}
-SECRET_NAMES = (
-    "IDKAT_SECRET",
-    "APP_URL",
-    "GEMINI_API_KEY",
-    "GEMINI_MODEL",
-    "SMTP_HOST",
-    "SMTP_PORT",
-    "SMTP_USER",
-    "SMTP_PASSWORD",
-    "SMTP_FROM",
-    "HIBP_API_KEY",
-    "DAILY_SCAN_CAP",
-)
+SECRET_NAMES = ("IDKAT_SECRET", "GEMINI_API_KEY", "GEMINI_MODEL", "HIBP_API_KEY", "DAILY_SCAN_CAP")
 
 
 def secret(name, default=None):
@@ -168,16 +116,28 @@ def app_secret():
 def _store():
     return {
         "lock": threading.Lock(),
-        "used_links": {},
-        "link_requests": {},
+        "users": {},      # username -> { salt, pw_hash }
         "scans": {},
-        "names": {},
         "jobs": {},
         "daily_total": {},
     }
 
 
 STORE = _store()
+
+
+def hash_password(password: str, salt: bytes = None) -> tuple[str, str]:
+    """Hashes password with PBKDF2-HMAC-SHA256."""
+    if salt is None:
+        salt = pysecrets.token_bytes(16)
+    pw_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+    return salt.hex(), pw_hash.hex()
+
+
+def verify_password(password: str, salt_hex: str, pw_hash_hex: str) -> bool:
+    salt = bytes.fromhex(salt_hex)
+    _, new_hash = hash_password(password, salt)
+    return hmac.compare_digest(new_hash, pw_hash_hex)
 
 
 def fingerprint(value):
@@ -190,16 +150,10 @@ def purge_expired():
     now = time.time()
     with STORE["lock"]:
         for job_id in [
-            j
-            for j, job in STORE["jobs"].items()
-            if now - job["started"] > RESULTS_HOURS * 3600
+            j for j, job in STORE["jobs"].items() if now - job["started"] > RESULTS_HOURS * 3600
         ]:
             del STORE["jobs"][job_id]
-        for key in [k for k, until in STORE["used_links"].items() if until < now]:
-            del STORE["used_links"][key]
-        for key in [k for k, v in STORE["names"].items() if v["until"] < now]:
-            del STORE["names"][key]
-        for bucket in ("link_requests", "scans"):
+        for bucket in ("scans",):
             for key in list(STORE[bucket]):
                 STORE[bucket][key] = [t for t in STORE[bucket][key] if now - t < 86400]
 
@@ -215,111 +169,9 @@ def within_limit(bucket, key, limit, seconds):
 
 
 # ============================================================================
-# 2. SIGN-IN & CONSENT
-# ============================================================================
-def _b64(text):
-    return urlsafe_b64encode(text.encode()).decode().rstrip("=")
-
-
-def _unb64(text):
-    return urlsafe_b64decode(text + "=" * (-len(text) % 4)).decode()
-
-
-def _sign(body):
-    return hmac.new(app_secret(), body.encode(), "sha256").hexdigest()[:32]
-
-
-def make_token(email, minutes, kind):
-    body = (
-        f"{kind}|{email}|{int(time.time()) + minutes * 60}|{pysecrets.token_urlsafe(8)}"
-    )
-    return f"{_b64(body)}.{_sign(body)}"
-
-
-def read_token(token, kind, single_use=False):
-    try:
-        encoded, sig = str(token).split(".")
-        body = _unb64(encoded)
-        token_kind, email, expiry, nonce = body.split("|")
-        expiry = int(expiry)
-    except (ValueError, UnicodeDecodeError):
-        return None
-    if not app_secret() or token_kind != kind or expiry < time.time():
-        return None
-    if not hmac.compare_digest(sig, _sign(body)):
-        return None
-    if single_use:
-        with STORE["lock"]:
-            if nonce in STORE["used_links"]:
-                return None
-            STORE["used_links"][nonce] = expiry
-    return email
-
-
-def smtp_ready():
-    return all(secret(k) for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD"))
-
-
-def send_email(to, subject, text, attachments=()):
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = str(secret("SMTP_FROM", secret("SMTP_USER")))
-    msg["To"] = to
-    msg.set_content(text)
-    for name, data in attachments:
-        msg.add_attachment(data, maintype="application", subtype="pdf", filename=name)
-    host, port = str(secret("SMTP_HOST")), int(secret("SMTP_PORT", 587))
-    context = ssl.create_default_context()
-    if port == 465:
-        server = smtplib.SMTP_SSL(host, port, context=context, timeout=30)
-    else:
-        server = smtplib.SMTP(host, port, timeout=30)
-        server.starttls(context=context)
-    with server:
-        server.login(str(secret("SMTP_USER")), str(secret("SMTP_PASSWORD")))
-        server.send_message(msg)
-
-
-CONSENT_TEXT = (
-    "By signing in, you confirm that:\n"
-    "- you are using IDkat to check information about yourself, not anyone else;\n"
-    "- your name and optional city will be used to search the public web, processed by Google Gemini;\n"
-    "- all identifying clues (links, handles, workplaces, past cities) stay private in code and are never sent to search or saved;\n"
-    "- your reports will contain ZERO information about anyone else;\n"
-    f"- your results are deleted after {RESULTS_HOURS} hours or as soon as reports are emailed."
-)
-
-
-def sign_in_link(email):
-    base = str(secret("APP_URL", "")).rstrip("/")
-    return f"{base}/?t={make_token(email, LINK_MINUTES, 'link')}"
-
-
-def email_sign_in_link(email):
-    send_email(
-        email,
-        "Your IDkat sign-in link",
-        f"Hello,\n\nHere's your sign-in link (valid for {LINK_MINUTES} mins):\n\n"
-        f"{sign_in_link(email)}\n\n{CONSENT_TEXT}\n",
-    )
-
-
-def signed_in_email():
-    return st.session_state.get("email")
-
-
-def sign_out():
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.query_params.clear()
-
-
-# ============================================================================
-# 3. PRIVATE EVIDENCE MATCHING (LOCAL ENGINE)
+# 2. PRIVATE EVIDENCE MATCHING (LOCAL ENGINE)
 # ============================================================================
 class LocalEvidenceExtractor:
-    """Evaluates raw page snippets against user-provided clues strictly in local Python code."""
-
     @staticmethod
     def evaluate(item, clues):
         matching_clues = []
@@ -328,37 +180,29 @@ class LocalEvidenceExtractor:
         url = norm_url(item.get("url", ""))
         snippet = (item.get("site", "") + " " + item.get("snippet", "")).lower()
 
-        # Direct link match
         for known_link in clues.get("known_links", []):
             if known_link and norm_url(known_link) in url:
                 matching_clues.append("Known personal profile link")
 
-        # Username / Handle
         for handle in clues.get("usernames", []):
             clean_handle = handle.lower().lstrip("@").strip()
-            if clean_handle and clean_handle in snippet or clean_handle in url:
+            if clean_handle and (clean_handle in snippet or clean_handle in url):
                 matching_clues.append(f"Matching username (@{clean_handle})")
 
-        # Workplaces & Schools
         for org in clues.get("workplaces_schools", []):
             if org.strip() and org.lower() in snippet:
                 matching_clues.append(f"Matching workplace/school ({org})")
 
-        # Cities & Past Locations
         user_locations = [clues.get("current_city", "")] + clues.get("past_cities", [])
-        matched_loc = False
         for loc in user_locations:
             if loc.strip() and loc.lower() in snippet:
                 matching_clues.append(f"Matching location ({loc})")
-                matched_loc = True
 
-        # Check for conflicts (Page mentions a distinct city/workplace not in user clues)
         detected_cities = item.get("detected_cities", [])
         for city in detected_cities:
             if city.lower() not in [l.lower() for l in user_locations if l.strip()]:
                 conflicting_clues.append(f"Different location detected ({city})")
 
-        # Apply strict rules
         if len(conflicting_clues) > 0:
             match_status = "Someone else"
         elif len(matching_clues) >= 2 or any("Known personal profile link" in m for m in matching_clues):
@@ -373,7 +217,7 @@ class LocalEvidenceExtractor:
 
 
 # ============================================================================
-# 4. SEARCH ENGINE (Google Search via Gemini)
+# 3. SEARCH ENGINE (Google Search via Gemini)
 # ============================================================================
 class Exposure(BaseModel):
     site: str = Field(description="The website's name.")
@@ -481,9 +325,8 @@ def generate(client, model, prompt, schema=None, search=False):
 def search_prompt(profile, focus):
     aka = f" Alternate names: {profile['aka']}." if profile["aka"] else ""
     where = f" City: {profile['location']}." if profile["location"] else ""
-    email_q = f" Include query for email: {profile['email']}." if profile["include_email"] else ""
     return f"""Today is {datetime.date.today():%d %B %Y}.
-Find public web pages referencing: "{profile['name']}".{aka}{where}{email_q}
+Find public web pages referencing: "{profile['name']}".{aka}{where}
 Focus on: {focus}.
 Report site, exact URL, exposed types, and any location names mentioned. Never disclose sensitive private details in output text."""
 
@@ -501,7 +344,7 @@ NOTES
 
 def hibp_breaches(email):
     key = secret("HIBP_API_KEY")
-    if not key:
+    if not key or not email:
         return None
     try:
         r = requests.get(
@@ -572,7 +415,6 @@ def run_scan(job, profile, clues, channels, api_key, model):
                     "url": (e.get("source_url") if norm_url(e.get("source_url")) in allowed else ""),
                     "removal_link": (e.get("removal_link") if norm_url(e.get("removal_link")) in allowed else ""),
                 }
-                # Local evidence matching engine (Gemini never sees clues)
                 item = LocalEvidenceExtractor.evaluate(item, clues)
 
                 key = norm_url(item["url"]) or f"{item['site'].lower()}|{item['page_type']}"
@@ -580,7 +422,7 @@ def run_scan(job, profile, clues, channels, api_key, model):
                     seen.add(key)
                     items.append(item)
 
-        breaches = hibp_breaches(profile["email"]) if profile["include_email"] else None
+        breaches = hibp_breaches(profile.get("check_email")) if profile.get("check_email") else None
 
         job["result"] = {
             "items": items,
@@ -593,10 +435,10 @@ def run_scan(job, profile, clues, channels, api_key, model):
         job["status"], job["error"] = "failed", f"Search halted: {str(exc)[:300]}"
 
 
-def start_scan(email, profile, clues, channels):
+def start_scan(username, profile, clues, channels):
     job = {
         "id": uuid.uuid4().hex[:12],
-        "owner": fingerprint(email),
+        "owner": fingerprint(username),
         "status": "running",
         "progress": "Starting search",
         "started": time.time(),
@@ -612,21 +454,24 @@ def start_scan(email, profile, clues, channels):
     ).start()
 
 
-def my_job(email):
-    owner = fingerprint(email)
+def my_job(username):
+    owner = fingerprint(username)
     jobs = [j for j in list(STORE["jobs"].values()) if j["owner"] == owner]
     return max(jobs, key=lambda j: j["started"]) if jobs else None
 
 
-def delete_my_results(email):
-    owner = fingerprint(email)
+def delete_user_and_results(username):
+    """Purges all active scan jobs and account details for the user from memory."""
+    owner = fingerprint(username)
     with STORE["lock"]:
         for job_id in [j for j, job in STORE["jobs"].items() if job["owner"] == owner]:
             del STORE["jobs"][job_id]
+        if username.lower() in STORE["users"]:
+            del STORE["users"][username.lower()]
 
 
 # ============================================================================
-# 5. REPORTS (STRICTLY NO OTHER PEOPLE)
+# 4. REPORT PDF GENERATION
 # ============================================================================
 def _pdf_fonts():
     base = Path(matplotlib.get_data_path()) / "fonts" / "ttf"
@@ -710,23 +555,10 @@ class Report(FPDF):
         self.ln(1.5)
 
 
-def summary_pdf(verified_items, excluded_count, name, finished):
+def generate_full_pdf(verified_items, breaches, excluded_count, name, finished):
     pdf = Report()
-    pdf.band(f"Summary for {name}", f"Generated {finished}")
-    pdf.section("Verified Pages Found", f"We verified {len(verified_items)} page(s) belonging to you.")
-    
-    for item in verified_items:
-        pdf.item("#B5654F", f"{item['site']} ({item['page_type']})", [("", f"Exposes: {', '.join(item['exposed'])}")])
-
-    if excluded_count > 0:
-        pdf.section("Privacy Filter Notice", f"{excluded_count} page(s) about other people were left out.")
-    return bytes(pdf.output())
-
-
-def full_pdf(verified_items, breaches, excluded_count, name, finished):
-    pdf = Report()
-    pdf.band(f"Full Report: {name}", f"Generated {finished}")
-    pdf.section("Your Verified Online Footprint", f"Showing {len(verified_items)} confirmed page(s).")
+    pdf.band(f"Full Action Plan: {name}", f"Generated {finished}")
+    pdf.section("Your Verified Footprint", f"Showing {len(verified_items)} confirmed page(s).")
 
     for item in verified_items:
         link = f" Opt-out link: {item['removal_link']}" if item['removal_link'] else ""
@@ -746,13 +578,13 @@ def full_pdf(verified_items, breaches, excluded_count, name, finished):
             pdf.item("#B5654F", f"{b['name']} ({b['date']})", [("", f"Data: {b['data']}")])
 
     if excluded_count > 0:
-        pdf.section("Privacy Notice", f"{excluded_count} page(s) identified as other individuals with your name were omitted.")
+        pdf.section("Privacy Notice", f"{excluded_count} page(s) identified as belonging to other individuals were omitted.")
 
     return bytes(pdf.output())
 
 
 # ============================================================================
-# 6. STREAMLIT INTERFACE & INTERACTIVE VERIFICATION
+# 5. USER INTERFACE & AUTHENTICATION
 # ============================================================================
 st.markdown(
     f"""<style>
@@ -762,56 +594,77 @@ st.markdown(
 .idk-band .title {{ font-size:2.2rem; color:{BONE}; font-weight:600; line-height:1.1; }}
 .idk-band .sub {{ color:{SAND}; font-style:italic; margin-top:4px; }}
 </style>
-<div class="idk-band"><div class="eyebrow">Your online footprint</div><div class="title">🐾 IDkat</div>
-<div class="sub">Find where your personal information appears online, with strict evidence-based matching.</div></div>""",
+<div class="idk-band"><div class="eyebrow">Your online footprint</div><div class="title">🐾 IDkat v2</div>
+<div class="sub">Find where your personal information appears online, with strict local evidence-based matching.</div></div>""",
     unsafe_allow_html=True,
 )
 
 purge_expired()
-ready = bool(app_secret()) and smtp_ready() and bool(secret("GEMINI_API_KEY")) and bool(secret("APP_URL"))
-if not ready:
-    st.error("IDkat setup incomplete. Missing secrets/keys.")
+
+if "username" not in st.session_state:
+    st.session_state.username = None
+
+# Login / Sign-up View
+if not st.session_state.username:
+    tab1, tab2 = st.tabs(["Sign In", "Create Account"])
+
+    with tab1:
+        st.subheader("Log in to IDkat")
+        with st.form("login_form"):
+            user_in = st.text_input("Username")
+            pass_in = st.text_input("Password", type="password")
+            login_btn = st.form_submit_button("Sign In", type="primary")
+
+        if login_btn:
+            u = user_in.strip().lower()
+            with STORE["lock"]:
+                user_data = STORE["users"].get(u)
+            if user_data and verify_password(pass_in, user_data["salt"], user_data["pw_hash"]):
+                st.session_state.username = user_in.strip()
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+
+    with tab2:
+        st.subheader("Create a temporary account")
+        st.caption("Account records live in RAM only and are deleted immediately upon downloading your report.")
+        with st.form("signup_form"):
+            new_user = st.text_input("Choose a Username")
+            new_pass = st.text_input("Choose a Password", type="password")
+            confirm_pass = st.text_input("Confirm Password", type="password")
+            signup_btn = st.form_submit_button("Create Account", type="primary")
+
+        if signup_btn:
+            u_clean = new_user.strip().lower()
+            if not u_clean or not new_pass:
+                st.error("Please fill in all fields.")
+            elif new_pass != confirm_pass:
+                st.error("Passwords do not match.")
+            elif len(new_pass) < 6:
+                st.error("Password must be at least 6 characters long.")
+            else:
+                with STORE["lock"]:
+                    if u_clean in STORE["users"]:
+                        st.error("Username already taken. Please choose another.")
+                    else:
+                        s_hex, h_hex = hash_password(new_pass)
+                        STORE["users"][u_clean] = {"salt": s_hex, "pw_hash": h_hex}
+                        st.session_state.username = new_user.strip()
+                        st.success("Account created!")
+                        st.rerun()
     st.stop()
 
-# Authentication checks
-if st.query_params.get("t") and not signed_in_email():
-    email = read_token(st.query_params.get("t"), "link", single_use=True)
-    del st.query_params["t"]
-    if email:
-        st.session_state.email = email
-        st.query_params["s"] = make_token(email, SESSION_HOURS * 60, "session")
-
-if st.query_params.get("s") and not signed_in_email():
-    email = read_token(st.query_params.get("s"), "session")
-    if email:
-        st.session_state.email = email
-
-email = signed_in_email()
-
-if not email:
-    st.markdown("Enter your email for a passwordless sign-in link.")
-    with st.form("sign_in"):
-        address = st.text_input("Your email address")
-        st.caption(CONSENT_TEXT)
-        agree_self = st.checkbox("Checking my own details only")
-        agree_terms = st.checkbox("I agree to terms")
-        send = st.form_submit_button("Email sign-in link")
-
-    if send and agree_self and agree_terms and EMAIL_RE.fullmatch(address.strip().lower()):
-        email_sign_in_link(address.strip().lower())
-        st.success("Sign-in link emailed.")
-    st.stop()
-
+# Signed-in user view
 top1, top2 = st.columns([3, 1])
-top1.markdown(f"Signed in as **{html.escape(email)}**")
-if top2.button("Sign out"):
-    sign_out()
+top1.markdown(f"Signed in as **{html.escape(st.session_state.username)}**")
+if top2.button("Log out"):
+    st.session_state.username = None
     st.rerun()
 
-job = my_job(email)
+job = my_job(st.session_state.username)
 
 if job and job["status"] == "running":
-    st.info(f"⏳ {job['progress']}... Results arrive live.")
+    st.info(f"⏳ {job['progress']}... Searching web indexes.")
     time.sleep(2)
     st.rerun()
 
@@ -819,12 +672,11 @@ if job and job["status"] == "done":
     res = job["result"]
     raw_items = res["items"]
 
-    # Session storage for user confirmations
     if "user_confirmations" not in st.session_state:
         st.session_state.user_confirmations = {}
 
     st.subheader("Review Search Results")
-    st.caption("Matches are decided by evidence. Confirm unverified pages below before reports are made.")
+    st.caption("Confirm unverified pages below before generating your downloadable report.")
 
     verified = []
     excluded_count = 0
@@ -833,7 +685,6 @@ if job and job["status"] == "done":
         item_id = f"item_{idx}"
         match_status = item["match"]
 
-        # User confirmation state override
         user_choice = st.session_state.user_confirmations.get(item_id, None)
 
         if user_choice == "yes" or match_status == "Likely you":
@@ -843,7 +694,6 @@ if job and job["status"] == "done":
         elif match_status == "Someone else" or user_choice == "no":
             excluded_count += 1
         else:
-            # Unconfirmed Item Needs User Confirmation
             st.warning(f"❓ **Unconfirmed Page:** {item['site']} ({item['page_type']})")
             if item.get("snippet"):
                 st.caption(f"Context snippet: *\"{item['snippet']}\"*")
@@ -856,29 +706,29 @@ if job and job["status"] == "done":
                 st.rerun()
 
     st.divider()
-    st.markdown(f"### 📊 Report Tally")
-    st.markdown(f"- **Pages to be included in your report:** {len(verified)}")
-    st.markdown(f"- **Pages left out (belong to other people):** {excluded_count}")
+    st.markdown(f"### 📊 Report Summary")
+    st.markdown(f"- **Pages to be included in report:** {len(verified)}")
+    st.markdown(f"- **Pages omitted (belong to other people):** {excluded_count}")
 
     st.divider()
-    if st.button("📧 Send verified reports & delete data from IDkat", type="primary"):
-        summary = summary_pdf(verified, excluded_count, res["name"], res["finished"])
-        full = full_pdf(verified, res["breaches"], excluded_count, res["name"], res["finished"])
-        send_email(
-            email,
-            "Your IDkat Reports",
-            "Your verified online footprint reports are attached.",
-            [("IDkat_Summary.pdf", summary), ("IDkat_Full_Report.pdf", full)],
-        )
-        delete_my_results(email)
-        st.success("Reports sent! All results deleted.")
-        sign_out()
+
+    # Direct File Download + Auto-Wipe
+    pdf_bytes = generate_full_pdf(verified, res["breaches"], excluded_count, res["name"], res["finished"])
+
+    if st.download_button(
+        label="📥 Download verified report & wipe my data",
+        data=pdf_bytes,
+        file_name=f"IDkat_Report_{res['name'].replace(' ', '_')}.pdf",
+        mime="application/pdf",
+        type="primary",
+    ):
+        delete_user_and_results(st.session_state.username)
+        st.session_state.username = None
+        st.success("Report downloaded! Account and search data purged from memory.")
         st.rerun()
     st.stop()
 
-# ============================================================================
-# SEARCH INPUT FORM WITH CLUE COLLECTION
-# ============================================================================
+# Search Form
 st.subheader("Search your online footprint")
 with st.form("scan_form"):
     name = st.text_input("Your full name")
@@ -886,17 +736,17 @@ with st.form("scan_form"):
     location = st.text_input("Current city/region (sent to search to disambiguate)", placeholder="e.g. Geelong")
 
     st.markdown("---")
-    st.markdown("#### Private Identifying Clues (Never sent to search, kept locally)")
-    st.caption("These clues stay in app memory and are compared only in local Python code.")
+    st.markdown("#### Private Identifying Clues (Never sent to search, evaluated locally)")
+    st.caption("These details are kept strictly in local code to evaluate matching confidence.")
 
     known_links = st.text_area("Links you know are yours (one per line)", placeholder="https://linkedin.com/in/yourname\nhttps://yourwebsite.com")
     past_cities = st.text_input("Past cities or suburbs lived in (comma-separated)", placeholder="e.g. Melbourne, Ballarat")
     workplaces = st.text_input("Current & past workplaces or schools (comma-separated)", placeholder="e.g. Acme Corp, Monash Uni")
     usernames = st.text_input("Usernames & handles (comma-separated)", placeholder="e.g. @janedoe88")
+    check_email = st.text_input("Email address (Optional: used only for Have I Been Pwned breach checks)", placeholder="user@example.com")
 
     st.markdown("---")
     channels = st.multiselect("Channels to search", list(CHANNELS), default=list(CHANNELS))
-    include_email = st.checkbox("Include email address in Google Search & HIBP check", value=False)
     confirm = st.checkbox("I confirm I am searching for myself")
 
     submit = st.form_submit_button("Start Private Search", type="primary")
@@ -914,19 +764,17 @@ if submit:
             "usernames": [u.strip() for u in usernames.split(",") if u.strip()],
         }
 
-        # Prompt for common names if clue count is low
         total_clues = sum(len(v) if isinstance(v, list) else (1 if v else 0) for v in clues_data.values())
         if total_clues < 2:
-            st.warning("⚠️ Common Name Prompt: Adding more clues (known links, past cities, handles) helps rule out namesakes much faster.")
+            st.warning("⚠️ Common Name Prompt: Adding more clues helps rule out namesakes much faster.")
 
         start_scan(
-            email,
+            st.session_state.username,
             {
                 "name": clean_name,
                 "aka": aka.strip(),
                 "location": location.strip(),
-                "email": email,
-                "include_email": include_email,
+                "check_email": check_email.strip(),
             },
             clues_data,
             channels,
