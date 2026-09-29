@@ -4,7 +4,7 @@ IDkat: Privacy & Media Intelligence Tool with Admin Analytics
 - Persistent user accounts & profile library.
 - Admin dashboard (`katadmin`) with privacy-safe metrics for advertising/monetization.
 - Full analytics tracking: logins, report downloads, active sessions, and churn audit logs.
-- SQLite persistence across app updates & deployment commits.
+- Automatic SQLite migration & database persistence across app updates.
 """
 
 import datetime
@@ -59,7 +59,7 @@ def app_secret():
     return value.encode() if len(value) >= 32 else b""
 
 # ============================================================================
-# 1. DATABASE SCHEMA & ANALYTICS TRACKING
+# 1. DATABASE SCHEMA, AUTO-MIGRATION & ANALYTICS TRACKING
 # ============================================================================
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -78,6 +78,14 @@ def init_db():
                 last_login REAL
             )
         """)
+        
+        # Check and migrate columns for older DB schemas
+        existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "is_admin" not in existing_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        if "last_login" not in existing_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN last_login REAL DEFAULT 0")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 token TEXT PRIMARY KEY,
@@ -362,7 +370,7 @@ Keep the language professional, direct, and actionable."""
         return f"Synthesis error: {str(e)}"
 
 # ============================================================================
-# 3. REPORT EXPORTERS
+# 3. UNICODE SAFE REPORT EXPORTERS
 # ============================================================================
 def clean_pdf_text(text):
     if not text:
@@ -509,7 +517,7 @@ if not st.session_state.username:
 
     with tab2:
         with st.form("signup"):
-            nu = st.text_input("Choose Username (use 'katadmin' to set up Admin account)")
+            nu = st.text_input("Choose Username")
             np = st.text_input("Choose Password", type="password")
             if st.form_submit_button("Create Account", type="primary"):
                 if nu and np:
@@ -521,12 +529,15 @@ if not st.session_state.username:
                             st.error("Username taken. Please choose another.")
                         else:
                             s, h = hash_password(np)
-                            conn.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)", (u_clean, s, h, is_admin_user, time.time(), time.time()))
+                            conn.execute(
+                                "INSERT INTO users (username, salt, pw_hash, is_admin, created_at, last_login) VALUES (?, ?, ?, ?, ?, ?)",
+                                (u_clean, s, h, is_admin_user, time.time(), time.time())
+                            )
                             conn.commit()
                             st.session_state.username = u_clean
                             create_session(u_clean)
                             log_event(u_clean, "account_created")
-                            st.success(f"Account created! {'Admin privileges granted.' if is_admin_user else ''}")
+                            st.success("Account created!")
                             time.sleep(0.5)
                             st.rerun()
                 else:
@@ -632,10 +643,12 @@ if is_admin:
         if user_list:
             u_data = []
             for u in user_list:
+                joined_ts = datetime.datetime.fromtimestamp(u["created_at"]).strftime("%d %b %Y %H:%M") if u["created_at"] else "N/A"
+                login_ts = datetime.datetime.fromtimestamp(u["last_login"]).strftime("%d %b %Y %H:%M") if u["last_login"] else "N/A"
                 u_data.append({
                     "Username": u["username"],
-                    "Joined": datetime.datetime.fromtimestamp(u["created_at"]).strftime("%d %b %Y %H:%M"),
-                    "Last Active": datetime.datetime.fromtimestamp(u["last_login"]).strftime("%d %b %Y %H:%M"),
+                    "Joined": joined_ts,
+                    "Last Active": login_ts,
                 })
             st.dataframe(u_data, width="stretch")
         else:
