@@ -12,9 +12,10 @@ import hashlib
 import hmac
 import html
 import io
+import json
 import re
 import secrets as pysecrets
-import threading
+import sqlite3
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -34,7 +35,8 @@ st.set_page_config(page_title="IDkat", page_icon="🐾", layout="centered")
 # ============================================================================
 DEFAULT_MODEL = "gemini-3.8-flash"
 FALLBACK_MODEL = "gemini-flash-latest"
-SESSION_HOURS = 12
+SESSION_HOURS = 24
+DB_FILE = "idkat_db.sqlite"
 INK, BONE, SAND, MUTED = "#14120F", "#F2EDE3", "#C6BCA9", "#8A8275"
 
 _SECRET_CACHE = {}
@@ -56,17 +58,42 @@ def app_secret():
     return value.encode() if len(value) >= 32 else b""
 
 # ============================================================================
-# 1. IN-MEMORY AUTHENTICATION & STORE
+# 1. DATABASE STORAGE (PERSISTS LOGINS & RESULTS ACROSS REBOOTS)
 # ============================================================================
-@st.cache_resource
-def _store():
-    return {
-        "lock": threading.Lock(),
-        "users": {},
-        "sessions": {},
-    }
+def get_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-STORE = _store()
+def init_db():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                salt TEXT,
+                pw_hash TEXT,
+                created_at REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                username TEXT,
+                expiry REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_data (
+                username TEXT PRIMARY KEY,
+                user_fullname TEXT,
+                search_results TEXT,
+                confirmations TEXT,
+                search_terms TEXT
+            )
+        """)
+        conn.commit()
+
+init_db()
 
 def hash_password(password: str, salt: bytes = None) -> tuple[str, str]:
     if salt is None:
@@ -91,11 +118,10 @@ def model_client(api_key):
 
 def create_session(username):
     token = pysecrets.token_urlsafe(24)
-    with STORE["lock"]:
-        STORE["sessions"][token] = {
-            "username": username,
-            "expiry": time.time() + (SESSION_HOURS * 3600)
-        }
+    expiry = time.time() + (SESSION_HOURS * 3600)
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)", (token, username, expiry))
+        conn.commit()
     st.query_params["session"] = token
     return token
 
@@ -103,25 +129,61 @@ def get_session_user():
     token = st.query_params.get("session")
     if not token:
         return None
-    with STORE["lock"]:
-        sess = STORE["sessions"].get(token)
-        if sess and sess["expiry"] > time.time():
-            return sess["username"]
-        elif sess:
-            del STORE["sessions"][token]
-            st.query_params.clear()
+    with get_db() as conn:
+        row = conn.execute("SELECT username, expiry FROM sessions WHERE token = ?", (token,)).fetchone()
+        if row:
+            if row["expiry"] > time.time():
+                return row["username"]
+            else:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                conn.commit()
+                st.query_params.clear()
     return None
 
 def destroy_session():
     token = st.query_params.get("session")
     if token:
-        with STORE["lock"]:
-            if token in STORE["sessions"]:
-                del STORE["sessions"][token]
+        with get_db() as conn:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
     st.query_params.clear()
 
+def save_user_state(username, fullname, results, confirmations, terms):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_data VALUES (?, ?, ?, ?, ?)",
+            (
+                username,
+                fullname,
+                json.dumps(results),
+                json.dumps(confirmations),
+                json.dumps(terms),
+            )
+        )
+        conn.commit()
+
+def load_user_state(username):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM user_data WHERE username = ?", (username,)).fetchone()
+        if row:
+            return {
+                "fullname": row["user_fullname"],
+                "results": json.loads(row["search_results"]),
+                "confirmations": json.loads(row["confirmations"]),
+                "terms": json.loads(row["search_terms"]),
+            }
+    return None
+
+def delete_user_permanently(username):
+    with get_db() as conn:
+        conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.execute("DELETE FROM user_data WHERE username = ?", (username,))
+        conn.execute("DELETE FROM sessions WHERE username = ?", (username,))
+        conn.commit()
+    destroy_session()
+
 # ============================================================================
-# 2. RELIABLE SEARCH PASS EXECUTION
+# 2. RELIABLE SEARCH EXECUTION
 # ============================================================================
 def execute_search_pass(client, model, query_str):
     config = types.GenerateContentConfig(
@@ -162,17 +224,17 @@ def run_3_pass_search(name, locations, workplaces, handles, api_key, model):
 
     progress_bar = st.progress(0, text="Starting 3-Pass Search...")
 
-    # Pass 1: Social Profiles & Handles
+    # Pass 1: Social Profiles
     progress_bar.progress(20, text="Pass 1/3: Checking social profiles and handles...")
     q1 = f'"{name}" ' + " ".join([f'"{h}"' for h in handles if h])
     res1 = execute_search_pass(client, model, q1)
 
-    # Pass 2: Workplaces & Companies
+    # Pass 2: Workplaces
     progress_bar.progress(50, text="Pass 2/3: Checking workplaces and business records...")
     q2 = f'"{name}" ' + " ".join([f'"{w}"' for w in workplaces if w])
     res2 = execute_search_pass(client, model, q2)
 
-    # Pass 3: Locations & Regional Directories
+    # Pass 3: Locations
     progress_bar.progress(80, text="Pass 3/3: Checking cities and regional listings...")
     q3 = f'"{name}" ' + " ".join([f'"{l}"' for l in locations if l])
     res3 = execute_search_pass(client, model, q3)
@@ -193,12 +255,6 @@ def run_3_pass_search(name, locations, workplaces, handles, api_key, model):
             all_found.append(item)
 
     return all_found
-
-def delete_user_data(username):
-    with STORE["lock"]:
-        if username.lower() in STORE["users"]:
-            del STORE["users"][username.lower()]
-    destroy_session()
 
 # ============================================================================
 # 3. REPORT EXPORTERS
@@ -264,7 +320,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Restore or verify session
+# Restore session from persistent DB
 current_user = get_session_user()
 if current_user and "username" not in st.session_state:
     st.session_state.username = current_user
@@ -280,6 +336,15 @@ if "search_terms" not in st.session_state:
 if "user_fullname" not in st.session_state:
     st.session_state.user_fullname = ""
 
+# Load state if logged in but state empty
+if st.session_state.username and not st.session_state.search_results:
+    db_state = load_user_state(st.session_state.username)
+    if db_state:
+        st.session_state.user_fullname = db_state["fullname"]
+        st.session_state.search_results = db_state["results"]
+        st.session_state.confirmations = db_state["confirmations"]
+        st.session_state.search_terms = db_state["terms"]
+
 # Authentication View
 if not st.session_state.username:
     tab1, tab2 = st.tabs(["Sign In", "Create Account"])
@@ -290,14 +355,14 @@ if not st.session_state.username:
             p_in = st.text_input("Password", type="password")
             if st.form_submit_button("Sign In", type="primary"):
                 u_clean = u_in.strip().lower()
-                with STORE["lock"]:
-                    u_data = STORE["users"].get(u_clean)
-                if u_data and verify_password(p_in, u_data["salt"], u_data["pw_hash"]):
-                    st.session_state.username = u_in.strip()
-                    create_session(u_in.strip())
+                with get_db() as conn:
+                    user_row = conn.execute("SELECT * FROM users WHERE username = ?", (u_clean,)).fetchone()
+                if user_row and verify_password(p_in, user_row["salt"], user_row["pw_hash"]):
+                    st.session_state.username = user_row["username"]
+                    create_session(user_row["username"])
                     st.rerun()
                 else:
-                    st.error("Invalid username or password. If you haven't created an account yet, click 'Create Account' above.")
+                    st.error("Invalid username or password. Please check your details or create a new account.")
 
     with tab2:
         with st.form("signup"):
@@ -306,14 +371,16 @@ if not st.session_state.username:
             if st.form_submit_button("Create Account", type="primary"):
                 if nu and np:
                     u_clean = nu.strip().lower()
-                    with STORE["lock"]:
-                        if u_clean in STORE["users"]:
-                            st.error("Username taken. Please pick another.")
+                    with get_db() as conn:
+                        existing = conn.execute("SELECT username FROM users WHERE username = ?", (u_clean,)).fetchone()
+                        if existing:
+                            st.error("Username already taken. Please choose another.")
                         else:
                             s, h = hash_password(np)
-                            STORE["users"][u_clean] = {"salt": s, "pw_hash": h}
-                            st.session_state.username = nu.strip()
-                            create_session(nu.strip())
+                            conn.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (u_clean, s, h, time.time()))
+                            conn.commit()
+                            st.session_state.username = u_clean
+                            create_session(u_clean)
                             st.success("Account created!")
                             time.sleep(0.5)
                             st.rerun()
@@ -373,6 +440,13 @@ if not st.session_state.search_results:
                 model_name
             )
             st.session_state.search_results = results
+            save_user_state(
+                st.session_state.username,
+                st.session_state.user_fullname,
+                st.session_state.search_results,
+                st.session_state.confirmations,
+                st.session_state.search_terms,
+            )
             st.rerun()
 
 else:
@@ -400,9 +474,23 @@ else:
                 c1, c2 = st.columns(2)
                 if c1.button("This is me", key=f"yes_{idx}"):
                     st.session_state.confirmations[item_id] = "yes"
+                    save_user_state(
+                        st.session_state.username,
+                        st.session_state.user_fullname,
+                        st.session_state.search_results,
+                        st.session_state.confirmations,
+                        st.session_state.search_terms,
+                    )
                     st.rerun()
                 if c2.button("Not me", key=f"no_{idx}"):
                     st.session_state.confirmations[item_id] = "no"
+                    save_user_state(
+                        st.session_state.username,
+                        st.session_state.user_fullname,
+                        st.session_state.search_results,
+                        st.session_state.confirmations,
+                        st.session_state.search_terms,
+                    )
                     st.rerun()
             st.markdown("---")
 
@@ -427,6 +515,13 @@ else:
         if st.form_submit_button("Add Detail"):
             if new_term.strip():
                 st.session_state.search_terms.append({"term": new_term.strip(), "active": True, "type": "Custom"})
+                save_user_state(
+                    st.session_state.username,
+                    st.session_state.user_fullname,
+                    st.session_state.search_results,
+                    st.session_state.confirmations,
+                    st.session_state.search_terms,
+                )
                 st.rerun()
 
     st.markdown("#### Quick Narrow-Down Prompts")
@@ -434,10 +529,24 @@ else:
     with q_col1:
         if st.button("🔍 Check Business & ASIC Registers"):
             st.session_state.search_terms.append({"term": "ASIC business directorship register", "active": True, "type": "Corporate"})
+            save_user_state(
+                st.session_state.username,
+                st.session_state.user_fullname,
+                st.session_state.search_results,
+                st.session_state.confirmations,
+                st.session_state.search_terms,
+            )
             st.rerun()
     with q_col2:
         if st.button("🔍 Check Website Registrations"):
             st.session_state.search_terms.append({"term": "domain WHOIS registration website owner", "active": True, "type": "Domain"})
+            save_user_state(
+                st.session_state.username,
+                st.session_state.user_fullname,
+                st.session_state.search_results,
+                st.session_state.confirmations,
+                st.session_state.search_terms,
+            )
             st.rerun()
 
     if st.button("🚀 Run 1-Pass Search Extension", type="primary"):
@@ -455,6 +564,13 @@ else:
                     st.session_state.search_results.append(nr)
                     added_count += 1
             
+            save_user_state(
+                st.session_state.username,
+                st.session_state.user_fullname,
+                st.session_state.search_results,
+                st.session_state.confirmations,
+                st.session_state.search_terms,
+            )
             if added_count > 0:
                 st.success(f"Search updated! Found {added_count} new candidate pages.")
             else:
@@ -490,9 +606,9 @@ else:
         mime=mtype,
         type="primary"
     ):
-        delete_user_data(st.session_state.username)
+        delete_user_permanently(st.session_state.username)
         st.session_state.username = None
         st.session_state.search_results = []
         st.session_state.confirmations = {}
-        st.success("Report downloaded! All session data deleted from IDkat.")
+        st.success("Report downloaded! All user details and search results permanently purged from IDkat.")
         st.rerun()
