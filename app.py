@@ -1,10 +1,10 @@
 """
-IDkat: Find and remove your personal details online.
+IDkat: Privacy & Media Intelligence Tool with Admin Analytics
 
-- Create an account and save personal search profiles to your library.
-- Synthesizes search findings into executive media & privacy intelligence reports.
-- Downloads export reports while keeping your login and profile library intact.
-- Full account deletion remains available at any time.
+- Persistent user accounts & profile library.
+- Admin dashboard (`katadmin`) with privacy-safe metrics for advertising/monetization.
+- Full analytics tracking: logins, report downloads, active sessions, and churn audit logs.
+- SQLite persistence across app updates & deployment commits.
 """
 
 import datetime
@@ -35,8 +35,9 @@ st.set_page_config(page_title="IDkat", page_icon="🐾", layout="centered")
 # ============================================================================
 DEFAULT_MODEL = "gemini-3.8-flash"
 FALLBACK_MODEL = "gemini-flash-latest"
-SESSION_HOURS = 168  # 7-day persistent login sessions
+SESSION_HOURS = 168  # 7-day persistent sessions
 DB_FILE = "idkat_db.sqlite"
+ADMIN_USERNAME = "katadmin"
 INK, BONE, SAND, MUTED = "#14120F", "#F2EDE3", "#C6BCA9", "#8A8275"
 
 _SECRET_CACHE = {}
@@ -58,7 +59,7 @@ def app_secret():
     return value.encode() if len(value) >= 32 else b""
 
 # ============================================================================
-# 1. DATABASE STORAGE (PERSISTENT ACCOUNTS & PROFILE LIBRARY)
+# 1. DATABASE SCHEMA & ANALYTICS TRACKING
 # ============================================================================
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -72,7 +73,9 @@ def init_db():
                 username TEXT PRIMARY KEY,
                 salt TEXT,
                 pw_hash TEXT,
-                created_at REAL
+                is_admin INTEGER DEFAULT 0,
+                created_at REAL,
+                last_login REAL
             )
         """)
         conn.execute("""
@@ -105,9 +108,42 @@ def init_db():
                 synthesis TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS usage_analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                event_type TEXT,
+                details TEXT,
+                timestamp REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                action TEXT,
+                timestamp REAL
+            )
+        """)
         conn.commit()
 
 init_db()
+
+def log_event(username, event_type, details=""):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO usage_analytics (username, event_type, details, timestamp) VALUES (?, ?, ?, ?)",
+            (username, event_type, details, time.time())
+        )
+        conn.commit()
+
+def log_audit(username, action):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO audit_logs (username, action, timestamp) VALUES (?, ?, ?)",
+            (username, action, time.time())
+        )
+        conn.commit()
 
 def hash_password(password: str, salt: bytes = None) -> tuple[str, str]:
     if salt is None:
@@ -135,8 +171,10 @@ def create_session(username):
     expiry = time.time() + (SESSION_HOURS * 3600)
     with get_db() as conn:
         conn.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)", (token, username, expiry))
+        conn.execute("UPDATE users SET last_login = ? WHERE username = ?", (time.time(), username))
         conn.commit()
     st.query_params["session"] = token
+    log_event(username, "session_created")
     return token
 
 def get_session_user():
@@ -171,6 +209,7 @@ def save_profile(username, profile_name, fullname, locations, workplaces, handle
             (profile_id, username, profile_name, fullname, locations, workplaces, handles, time.time())
         )
         conn.commit()
+    log_event(username, "profile_created", f"Name: {profile_name}")
     return profile_id
 
 def get_user_profiles(username):
@@ -219,6 +258,7 @@ def clear_workspace(username):
         conn.commit()
 
 def delete_entire_account(username):
+    log_audit(username, "account_deleted")
     with get_db() as conn:
         conn.execute("DELETE FROM users WHERE username = ?", (username,))
         conn.execute("DELETE FROM user_profiles WHERE username = ?", (username,))
@@ -322,7 +362,7 @@ Keep the language professional, direct, and actionable."""
         return f"Synthesis error: {str(e)}"
 
 # ============================================================================
-# 3. UNICODE SAFE REPORT EXPORTERS
+# 3. REPORT EXPORTERS
 # ============================================================================
 def clean_pdf_text(text):
     if not text:
@@ -400,7 +440,7 @@ def generate_txt(verified_items, name, synthesis=""):
     return "\n".join(lines).encode("utf-8")
 
 # ============================================================================
-# 4. STREAMLIT INTERFACE
+# 4. STREAMLIT INTERFACE & ADMIN DASHBOARD
 # ============================================================================
 st.markdown(
     f"""<style>
@@ -413,7 +453,7 @@ st.markdown(
 <div class="idk-band">
   <div class="eyebrow">Privacy & Media Intelligence Tool</div>
   <div class="title">🐾 IDkat</div>
-  <div class="sub">Find where your personal information appears online, review what's exposed, and export a synthesized intelligence report. Save profile libraries to your account.</div>
+  <div class="sub">Find where your personal information appears online, review what's exposed, and export a synthesized intelligence report. All your data is retained in your account library.</div>
 </div>""",
     unsafe_allow_html=True,
 )
@@ -462,38 +502,44 @@ if not st.session_state.username:
                 if user_row and verify_password(p_in, user_row["salt"], user_row["pw_hash"]):
                     st.session_state.username = user_row["username"]
                     create_session(user_row["username"])
+                    log_event(user_row["username"], "login_success")
                     st.rerun()
                 else:
                     st.error("Invalid username or password.")
 
     with tab2:
         with st.form("signup"):
-            nu = st.text_input("Choose Username")
+            nu = st.text_input("Choose Username (use 'katadmin' to set up Admin account)")
             np = st.text_input("Choose Password", type="password")
             if st.form_submit_button("Create Account", type="primary"):
                 if nu and np:
                     u_clean = nu.strip().lower()
+                    is_admin_user = 1 if u_clean == ADMIN_USERNAME else 0
                     with get_db() as conn:
                         existing = conn.execute("SELECT username FROM users WHERE username = ?", (u_clean,)).fetchone()
                         if existing:
                             st.error("Username taken. Please choose another.")
                         else:
                             s, h = hash_password(np)
-                            conn.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (u_clean, s, h, time.time()))
+                            conn.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)", (u_clean, s, h, is_admin_user, time.time(), time.time()))
                             conn.commit()
                             st.session_state.username = u_clean
                             create_session(u_clean)
-                            st.success("Account created!")
+                            log_event(u_clean, "account_created")
+                            st.success(f"Account created! {'Admin privileges granted.' if is_admin_user else ''}")
                             time.sleep(0.5)
                             st.rerun()
                 else:
                     st.error("Please fill in both fields.")
     st.stop()
 
-# Account Sidebar & Profile Library
+# Check Admin Status
+is_admin = (st.session_state.username.lower() == ADMIN_USERNAME)
+
+# Sidebar
 with st.sidebar:
     st.title("👤 Account")
-    st.write(f"Logged in: **{st.session_state.username}**")
+    st.write(f"Logged in: **{st.session_state.username}** {'(Admin)' if is_admin else ''}")
     
     if st.button("Log out", width="stretch"):
         destroy_session()
@@ -501,41 +547,132 @@ with st.sidebar:
         st.session_state.search_results = []
         st.rerun()
 
-    st.divider()
-    st.subheader("📁 Profile Library")
-    saved_profiles = get_user_profiles(st.session_state.username)
-    
-    if saved_profiles:
-        for p in saved_profiles:
-            st.markdown(f"**{p['profile_name']}** ({p['fullname']})")
-            col_p1, col_p2 = st.columns([3, 1])
-            if col_p1.button("Load Profile", key=f"load_{p['profile_id']}"):
-                st.session_state.selected_profile_id = p["profile_id"]
-                st.session_state.user_fullname = p["fullname"]
-                st.session_state.search_results = []
-                st.session_state.confirmations = {}
-                st.session_state.synthesis = ""
-                st.rerun()
-            if col_p2.button("🗑️", key=f"del_{p['profile_id']}"):
-                delete_profile(p["profile_id"])
-                st.rerun()
-            st.markdown("---")
-    else:
-        st.caption("No saved profiles in your library yet.")
+    if not is_admin:
+        st.divider()
+        st.subheader("📁 Profile Library")
+        saved_profiles = get_user_profiles(st.session_state.username)
+        
+        if saved_profiles:
+            for p in saved_profiles:
+                st.markdown(f"**{p['profile_name']}** ({p['fullname']})")
+                col_p1, col_p2 = st.columns([3, 1])
+                if col_p1.button("Load Profile", key=f"load_{p['profile_id']}"):
+                    st.session_state.selected_profile_id = p["profile_id"]
+                    st.session_state.user_fullname = p["fullname"]
+                    st.session_state.search_results = []
+                    st.session_state.confirmations = {}
+                    st.session_state.synthesis = ""
+                    st.rerun()
+                if col_p2.button("🗑️", key=f"del_{p['profile_id']}"):
+                    delete_profile(p["profile_id"])
+                    st.rerun()
+                st.markdown("---")
+        else:
+            st.caption("No saved profiles in your library yet.")
 
-    st.divider()
-    with st.expander("Danger Zone"):
-        if st.button("Delete My Account & All Data", type="primary"):
-            delete_entire_account(st.session_state.username)
-            st.session_state.username = None
-            st.session_state.search_results = []
-            st.rerun()
+        st.divider()
+        with st.expander("Danger Zone"):
+            if st.button("Delete My Account & All Data", type="primary"):
+                delete_entire_account(st.session_state.username)
+                st.session_state.username = None
+                st.session_state.search_results = []
+                st.rerun()
 
 api_key = str(secret("GEMINI_API_KEY", "") or "")
 model_name = str(secret("GEMINI_MODEL", DEFAULT_MODEL))
 
 # ============================================================================
-# DASHBOARD WORKSPACE
+# ADMIN PANEL VIEW (Only visible to katadmin)
+# ============================================================================
+if is_admin:
+    st.subheader("⚙️ Admin Analytics & User Management")
+    st.caption("Platform analytics and privacy-safe user metrics for media & advertiser insights.")
+
+    tab_a1, tab_a2, tab_a3 = st.tabs(["📊 Analytics & Media Metrics", "👥 User List & Sessions", "💾 Database Backup"])
+
+    with get_db() as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = 0").fetchone()[0]
+        active_sessions = conn.execute("SELECT COUNT(*) FROM sessions WHERE expiry > ?", (time.time(),)).fetchone()[0]
+        total_searches = conn.execute("SELECT COUNT(*) FROM usage_analytics WHERE event_type = 'search_run'").fetchone()[0]
+        total_reports = conn.execute("SELECT COUNT(*) FROM usage_analytics WHERE event_type = 'report_downloaded'").fetchone()[0]
+
+    with tab_a1:
+        st.markdown("#### Platform KPI Summary")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Registered Users", total_users)
+        m2.metric("Active Sessions", active_sessions)
+        m3.metric("Searches Executed", total_searches)
+        m4.metric("Reports Generated", total_reports)
+
+        st.divider()
+        st.markdown("#### 🎯 Aggregated Demographic & Regional Reach (For Advertisers)")
+        st.caption("Aggregated locations extracted from saved profiles without identifying individual users.")
+        
+        with get_db() as conn:
+            loc_rows = conn.execute("SELECT locations FROM user_profiles WHERE locations != ''").fetchall()
+        
+        all_locs = []
+        for r in loc_rows:
+            all_locs.extend([l.strip().title() for l in r["locations"].split(",") if l.strip()])
+        
+        if all_locs:
+            from collections import Counter
+            counts = Counter(all_locs).most_common(10)
+            st.write("**Top Target Audience Regions:**")
+            for loc, count in counts:
+                st.markdown(f"- **{loc}**: {count} profile(s)")
+        else:
+            st.info("No location demographic data compiled yet.")
+
+    with tab_a2:
+        st.markdown("#### User Accounts Audit")
+        with get_db() as conn:
+            user_list = conn.execute("SELECT username, created_at, last_login FROM users WHERE is_admin = 0 ORDER BY created_at DESC").fetchall()
+        
+        if user_list:
+            u_data = []
+            for u in user_list:
+                u_data.append({
+                    "Username": u["username"],
+                    "Joined": datetime.datetime.fromtimestamp(u["created_at"]).strftime("%d %b %Y %H:%M"),
+                    "Last Active": datetime.datetime.fromtimestamp(u["last_login"]).strftime("%d %b %Y %H:%M"),
+                })
+            st.dataframe(u_data, width="stretch")
+        else:
+            st.info("No registered users yet.")
+
+        st.divider()
+        st.markdown("#### Account Churn Audit Log")
+        with get_db() as conn:
+            audit_list = conn.execute("SELECT username, action, timestamp FROM audit_logs ORDER BY timestamp DESC LIMIT 20").fetchall()
+        
+        if audit_list:
+            a_data = [{
+                "Username": a["username"],
+                "Action": a["action"],
+                "Timestamp": datetime.datetime.fromtimestamp(a["timestamp"]).strftime("%d %b %Y %H:%M")
+            } for a in audit_list]
+            st.dataframe(a_data, width="stretch")
+
+    with tab_a3:
+        st.markdown("#### Database Backup & Deployment Safeguard")
+        st.caption("Download a copy of the SQLite database before pushing code updates to GitHub or Streamlit Cloud.")
+        
+        if Path(DB_FILE).exists():
+            with open(DB_FILE, "rb") as f:
+                db_bytes = f.read()
+            st.download_button(
+                label="📥 Download Complete Database Backup (.sqlite)",
+                data=db_bytes,
+                file_name=f"idkat_db_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.sqlite",
+                mime="application/x-sqlite3",
+                type="primary"
+            )
+
+    st.stop()
+
+# ============================================================================
+# REGULAR USER DASHBOARD
 # ============================================================================
 if not st.session_state.search_results:
     st.subheader("1. Start Your Search / Save Profile")
@@ -596,6 +733,7 @@ if not st.session_state.search_results:
                 st.session_state.search_terms,
                 st.session_state.synthesis,
             )
+            log_event(st.session_state.username, "search_run")
             st.rerun()
 
 else:
@@ -664,6 +802,7 @@ else:
                     st.session_state.search_terms,
                     st.session_state.synthesis,
                 )
+                log_event(st.session_state.username, "report_synthesized")
                 st.rerun()
 
         if st.session_state.synthesis:
@@ -791,6 +930,7 @@ else:
         type="primary"
     ):
         clear_workspace(st.session_state.username)
+        log_event(st.session_state.username, "report_downloaded", f"Format: {fmt}")
         st.session_state.search_results = []
         st.session_state.confirmations = {}
         st.session_state.synthesis = ""
