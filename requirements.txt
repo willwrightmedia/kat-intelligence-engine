@@ -1,0 +1,11 @@
+streamlit>=1.64
+google-genai>=2.25.0
+pydantic>=2
+requests
+fpdf2
+matplotlib
+pandas
+bcrypt
+cryptography
+sqlalchemy>=2
+psycopg2-binary
