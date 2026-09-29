@@ -1,10 +1,10 @@
 """
-IDkat v3.1: Persistent Session & Background Smart Search Engine
+IDkat: Find and remove your personal details online.
 
-- Persistent login tokens in URL query params (prevents logouts on refresh/reload).
-- Background threaded search execution (continues running if tab/window loses focus).
-- 3-Pass initial sweep with interactive term refining & real-time discovery.
-- PDF, Word (.docx), and Text (.txt) exports with full memory wipe on download.
+- Create an account and search the web for where your information appears.
+- Review candidate pages interactively and refine results with Smart Search.
+- Export verified results to PDF, Word, or Text.
+- Downloaded reports immediately delete all your data from IDkat.
 """
 
 import datetime
@@ -28,7 +28,7 @@ from fpdf import FPDF
 from google import genai
 from google.genai import types
 
-st.set_page_config(page_title="IDkat Smart Search", page_icon="🐾", layout="centered")
+st.set_page_config(page_title="IDkat", page_icon="🐾", layout="centered")
 
 # ============================================================================
 # 0. SETTINGS & CONSTANTS
@@ -65,7 +65,7 @@ def _store():
         "lock": threading.Lock(),
         "users": {},
         "jobs": {},
-        "sessions": {},  # token -> username
+        "sessions": {},
     }
 
 STORE = _store()
@@ -128,14 +128,14 @@ def destroy_session():
     st.query_params.clear()
 
 # ============================================================================
-# 2. BACKGROUND SEARCH ENGINE (CONTINUES WHEN TAB IS HIDDEN)
+# 2. SEARCH ENGINE EXECUTION
 # ============================================================================
 def execute_search_pass(client, model, query_str):
     config = types.GenerateContentConfig(
         tools=[types.Tool(google_search=types.GoogleSearch())],
         temperature=0.3
     )
-    prompt = f"Find public web pages, profiles, news, and directories for: {query_str}. Return key details found."
+    prompt = f"Find public web pages, social profiles, directories, and news for: {query_str}. List exact sites and URLs found."
 
     results = []
     try:
@@ -168,21 +168,21 @@ def run_background_initial_search(job, username, name, locations, workplaces, ha
         all_found = []
         seen_urls = set()
 
-        job["progress"] = "Pass 1/3: Sweeping Social Profiles & Handles..."
+        job["progress"] = "Pass 1/3: Checking social profiles and handles..."
         q1 = f'"{name}" ' + " ".join([f'"{h}"' for h in handles if h])
         res1 = execute_search_pass(client, model, q1)
 
-        job["progress"] = "Pass 2/3: Sweeping Workplaces & Directorships..."
+        job["progress"] = "Pass 2/3: Checking workplaces and business records..."
         q2 = f'"{name}" ' + " ".join([f'"{w}"' for w in workplaces if w])
         res2 = execute_search_pass(client, model, q2)
 
-        job["progress"] = "Pass 3/3: Sweeping Locations & Public Directories..."
+        job["progress"] = "Pass 3/3: Checking cities and regional listings..."
         q3 = f'"{name}" ' + " ".join([f'"{l}"' for l in locations if l])
         res3 = execute_search_pass(client, model, q3)
 
         if not (res1 or res2 or res3):
-            job["progress"] = "Broad Fallback Sweep..."
-            q_fallback = f'"{name}" Australia online profile directory'
+            job["progress"] = "Running fallback profile search..."
+            q_fallback = f'"{name}" online profile'
             res3.extend(execute_search_pass(client, model, q_fallback))
 
         for item in res1 + res2 + res3:
@@ -202,7 +202,7 @@ def start_initial_search_thread(username, name, locations, workplaces, handles, 
         "id": uuid.uuid4().hex[:12],
         "owner": fingerprint(username),
         "status": "running",
-        "progress": "Initializing 3-pass search...",
+        "progress": "Starting 3-pass search...",
         "started": time.time(),
         "result": None,
         "error": ""
@@ -237,7 +237,7 @@ def generate_pdf(verified_items, name):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, f"IDkat Verified Footprint: {name}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, f"IDkat Footprint Report: {name}", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
     pdf.cell(0, 5, f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
@@ -246,27 +246,27 @@ def generate_pdf(verified_items, name):
         pdf.set_font("Helvetica", "B", 11)
         pdf.cell(0, 6, item['site'], new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 9)
-        pdf.multi_cell(0, 4, f"URL: {item['url']}\nSummary: {item['snippet']}\nQuery matched: {item.get('query_used', 'N/A')}\n")
+        pdf.multi_cell(0, 4, f"URL: {item['url']}\nSummary: {item['snippet']}\nQuery: {item.get('query_used', 'N/A')}\n")
         pdf.ln(2)
     return bytes(pdf.output())
 
 def generate_docx(verified_items, name):
     doc = docx.Document()
-    doc.add_heading(f"IDkat Verified Footprint: {name}", 0)
+    doc.add_heading(f"IDkat Footprint Report: {name}", 0)
     doc.add_paragraph(f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}")
 
     for item in verified_items:
         doc.add_heading(item['site'], level=2)
         doc.add_paragraph(f"URL: {item['url']}")
         doc.add_paragraph(f"Summary: {item['snippet']}")
-        doc.add_paragraph(f"Search query: {item.get('query_used', 'N/A')}")
+        doc.add_paragraph(f"Search Query: {item.get('query_used', 'N/A')}")
 
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
 
 def generate_txt(verified_items, name):
-    lines = [f"IDKAT VERIFIED FOOTPRINT REPORT: {name}", f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}", "="*50, ""]
+    lines = [f"IDKAT FOOTPRINT REPORT: {name}", f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}", "="*50, ""]
     for item in verified_items:
         lines.append(f"Site: {item['site']}")
         lines.append(f"URL: {item['url']}")
@@ -276,7 +276,7 @@ def generate_txt(verified_items, name):
     return "\n".join(lines).encode("utf-8")
 
 # ============================================================================
-# 4. STREAMLIT INTERFACE & SESSION MANAGEMENT
+# 4. STREAMLIT INTERFACE & HEADER
 # ============================================================================
 st.markdown(
     f"""<style>
@@ -284,14 +284,17 @@ st.markdown(
 .idk-band {{ background:#1A1814; border:1px solid #2C2822; padding:22px 26px; margin-bottom:16px; }}
 .idk-band .eyebrow {{ font-size:0.72rem; letter-spacing:0.22em; color:{MUTED}; text-transform:uppercase; }}
 .idk-band .title {{ font-size:2.2rem; color:{BONE}; font-weight:600; line-height:1.1; }}
-.idk-band .sub {{ color:{SAND}; font-style:italic; margin-top:4px; }}
+.idk-band .sub {{ color:{SAND}; font-style:normal; margin-top:6px; font-size:1.0rem; }}
 </style>
-<div class="idk-band"><div class="eyebrow">Interactive Smart Search</div><div class="title">🐾 IDkat v3.1</div>
-<div class="sub">Persistent session & background multi-pass search engine.</div></div>""",
+<div class="idk-band">
+  <div class="eyebrow">Privacy & Footprint Tool</div>
+  <div class="title">🐾 IDkat</div>
+  <div class="sub">Find where your personal information appears online, review what's exposed, and export a report. All your data is deleted when you download.</div>
+</div>""",
     unsafe_allow_html=True,
 )
 
-# Restore or verify user session
+# Restore or verify session
 current_user = get_session_user()
 if current_user and "username" not in st.session_state:
     st.session_state.username = current_user
@@ -307,9 +310,10 @@ if "search_terms" not in st.session_state:
 if "user_fullname" not in st.session_state:
     st.session_state.user_fullname = ""
 
-# Authentication
+# Authentication View
 if not st.session_state.username:
     tab1, tab2 = st.tabs(["Sign In", "Create Account"])
+    
     with tab1:
         with st.form("login"):
             u_in = st.text_input("Username")
@@ -323,24 +327,31 @@ if not st.session_state.username:
                     create_session(u_in.strip())
                     st.rerun()
                 else:
-                    st.error("Invalid credentials.")
+                    st.error("Invalid username or password. If you haven't created an account yet, click 'Create Account' above.")
+
     with tab2:
         with st.form("signup"):
             nu = st.text_input("Choose Username")
             np = st.text_input("Choose Password", type="password")
             if st.form_submit_button("Create Account", type="primary"):
                 if nu and np:
+                    u_clean = nu.strip().lower()
                     with STORE["lock"]:
-                        if nu.strip().lower() in STORE["users"]:
-                            st.error("Username taken.")
+                        if u_clean in STORE["users"]:
+                            st.error("Username taken. Please pick another.")
                         else:
                             s, h = hash_password(np)
-                            STORE["users"][nu.strip().lower()] = {"salt": s, "pw_hash": h}
+                            STORE["users"][u_clean] = {"salt": s, "pw_hash": h}
                             st.session_state.username = nu.strip()
                             create_session(nu.strip())
+                            st.success("Account created! Logging you in...")
+                            time.sleep(1)
                             st.rerun()
+                else:
+                    st.error("Please fill in both fields.")
     st.stop()
 
+# Header Navigation
 top1, top2 = st.columns([3, 1])
 top1.markdown(f"Signed in as **{html.escape(st.session_state.username)}**")
 if top2.button("Log out"):
@@ -352,11 +363,11 @@ if top2.button("Log out"):
 api_key = str(secret("GEMINI_API_KEY", "") or "")
 model_name = str(secret("GEMINI_MODEL", DEFAULT_MODEL))
 
-# Check for running background search job
+# Check background job state
 active_job = get_active_job(st.session_state.username)
 
 if active_job and active_job["status"] == "running":
-    st.info(f"⏳ **Search running in background:** {active_job['progress']}  \n*You can close this tab or navigate away; the search will keep running.*")
+    st.info(f"⏳ **Search running:** {active_job['progress']}  \n*You can close or switch windows. The search runs on the server and will be ready when you return.*")
     time.sleep(3)
     st.rerun()
 
@@ -365,22 +376,22 @@ if active_job and active_job["status"] == "done" and not st.session_state.search
     st.rerun()
 
 # ============================================================================
-# SEARCH INTERFACE & RESULTS DASHBOARD
+# SEARCH & RESULTS DASHBOARD
 # ============================================================================
 if not st.session_state.search_results:
-    st.subheader("1. Initial 3-Pass Broad Search")
+    st.subheader("1. Start Your Search")
     with st.form("initial_search"):
         name = st.text_input("Full Name *", placeholder="e.g. Will Wright")
-        locations = st.text_input("Cities / Regions (comma separated)", placeholder="e.g. Geelong, Melbourne")
-        workplaces = st.text_area("Workplaces / Companies (one per line)", placeholder="e.g. Acme Media\nMonash University")
-        handles = st.text_input("Usernames / Social Handles (comma separated)", placeholder="e.g. @willwright, @willwrightmedia")
+        locations = st.text_input("Cities / Towns lived in", placeholder="e.g. Geelong, Melbourne")
+        workplaces = st.text_area("Workplaces / Companies / Schools", placeholder="e.g. Acme Media\nMonash University")
+        handles = st.text_input("Social Media Handles / Usernames", placeholder="e.g. @willwright, @willwrightmedia")
         
         confirm = st.checkbox("I confirm I am searching for information about myself")
-        start_btn = st.form_submit_button("Run Initial 3-Pass Search", type="primary")
+        start_btn = st.form_submit_button("Run 3-Pass Search", type="primary")
 
     if start_btn:
         if not name.strip() or not confirm:
-            st.error("Please enter your name and confirm authorization.")
+            st.error("Please enter your name and confirm you are searching for yourself.")
         else:
             st.session_state.user_fullname = name.strip()
             loc_list = [x.strip() for x in locations.split(",") if x.strip()]
@@ -407,9 +418,9 @@ if not st.session_state.search_results:
             st.rerun()
 
 else:
-    # RESULTS FOUND / INTERACTIVE DASHBOARD
-    st.subheader(f"Search Results ({len(st.session_state.search_results)} items found)")
-    st.caption("Review candidate pages below. Click 'This is me' to include in your final report.")
+    # Interactive Results Dashboard
+    st.subheader(f"Search Results ({len(st.session_state.search_results)} pages found)")
+    st.caption("Review candidate pages below. Click 'This is me' to include a page in your report.")
 
     verified = []
     excluded = 0
@@ -427,7 +438,7 @@ else:
             with st.container():
                 st.warning(f"❓ **Candidate Page:** {item['site']}")
                 st.write(f"**URL:** [{item['url']}]({item['url']})")
-                st.caption(f"Snippet: *\"{item['snippet']}\"*")
+                st.caption(f"Summary: *\"{item['snippet']}\"*")
                 c1, c2 = st.columns(2)
                 if c1.button("This is me", key=f"yes_{idx}"):
                     st.session_state.confirmations[item_id] = "yes"
@@ -437,10 +448,10 @@ else:
                     st.rerun()
             st.markdown("---")
 
-    # Smart Search Refinement Section
+    # Smart Search Refinement
     st.divider()
-    st.subheader("2. Smart Search Refinement (1-Pass Additional Searches)")
-    st.caption("Tick or untick terms to refine the next single-pass query, or add new custom terms.")
+    st.subheader("2. Refine Search")
+    st.caption("Tick or untick details below to refine your next single-pass search, or add custom terms.")
 
     selected_terms = []
     for term_obj in st.session_state.search_terms:
@@ -454,26 +465,25 @@ else:
             selected_terms.append(term_obj["term"])
 
     with st.form("add_custom_term"):
-        new_term = st.text_input("Add a new term to search (e.g. Maiden name, key project, board position)")
-        if st.form_submit_button("Add Term"):
+        new_term = st.text_input("Add another detail to search (e.g. Maiden name, project name, board role)")
+        if st.form_submit_button("Add Detail"):
             if new_term.strip():
                 st.session_state.search_terms.append({"term": new_term.strip(), "active": True, "type": "Custom"})
                 st.rerun()
 
-    st.markdown("#### 💬 Clarification Questions")
-    st.caption("Answering these questions creates targeted single-pass searches.")
+    st.markdown("#### Quick Narrow-Down Prompts")
     q_col1, q_col2 = st.columns(2)
     with q_col1:
-        if st.button("🔍 Search ASIC / Corporate Registers"):
+        if st.button("🔍 Check Business & ASIC Registers"):
             st.session_state.search_terms.append({"term": "ASIC business directorship register", "active": True, "type": "Corporate"})
             st.rerun()
     with q_col2:
-        if st.button("🔍 Search Domain WHOIS & Personal Websites"):
+        if st.button("🔍 Check Website Registrations"):
             st.session_state.search_terms.append({"term": "domain WHOIS registration website owner", "active": True, "type": "Domain"})
             st.rerun()
 
-    if st.button("🚀 Run 1-Pass Smart Search Now", type="primary"):
-        with st.spinner("Executing targeted 1-pass Smart Search..."):
+    if st.button("🚀 Run 1-Pass Search Extension", type="primary"):
+        with st.spinner("Searching for additional pages..."):
             client = model_client(api_key)
             query = f'"{st.session_state.user_fullname}" ' + " ".join([f'"{t}"' for t in selected_terms])
             new_results = execute_search_pass(client, model_name, query)
@@ -488,17 +498,17 @@ else:
                     added_count += 1
             
             if added_count > 0:
-                st.success(f"Smart Search complete! Added {added_count} new candidate pages.")
+                st.success(f"Search updated! Found {added_count} new candidate pages.")
             else:
-                st.info("No new additional pages found with selected terms.")
+                st.info("No additional new pages found with those terms.")
             time.sleep(1)
             st.rerun()
 
-    # Report Tally & Export
+    # Export & Complete Memory Wipe
     st.divider()
-    st.subheader("3. Export Verified Report")
-    st.write(f"- Verified pages confirmed: **{len(verified)}**")
-    st.write(f"- Candidate pages excluded: **{excluded}**")
+    st.subheader("3. Export & Delete Data")
+    st.write(f"- Pages verified for report: **{len(verified)}**")
+    st.write(f"- Pages excluded: **{excluded}**")
 
     fmt = st.selectbox("Select file format", ["PDF (.pdf)", "Word Document (.docx)", "Plain Text (.txt)"])
 
@@ -516,7 +526,7 @@ else:
         mtype = "text/plain"
 
     if st.download_button(
-        label=f"📥 Download {fmt} Report & Wipe Memory",
+        label=f"📥 Download {fmt} Report & Delete My Data",
         data=data,
         file_name=fname,
         mime=mtype,
@@ -526,5 +536,5 @@ else:
         st.session_state.username = None
         st.session_state.search_results = []
         st.session_state.confirmations = {}
-        st.success("Report downloaded and memory wiped!")
+        st.success("Report downloaded! All session data deleted from IDkat.")
         st.rerun()
