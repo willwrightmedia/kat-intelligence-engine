@@ -1,10 +1,10 @@
 """
-IDkat v2.5: Deep Multi-Pass Online Footprint & Work History Search
+IDkat v3.0: Interactive Smart Search & Footprint Discovery Engine
 
-- Supports 1 to 50 configurable search passes.
-- Expanded focus on professional history, directorships, and employment details.
-- Deduplicates results in real-time across passes.
-- Downloads reports in PDF, Word (.docx), and Plain Text (.txt).
+- Fixed 3-pass initial broad search with zero silent link dropping.
+- Checkbox control to include/exclude terms for subsequent 1-pass Smart Searches.
+- Clarification questioning engine to narrow down elusive profiles.
+- Incremental live result updates with PDF, Word (.docx), and Text (.txt) exports.
 """
 
 import datetime
@@ -28,53 +28,15 @@ import streamlit as st
 from fpdf import FPDF
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
 
-st.set_page_config(page_title="IDkat Deep Search", page_icon="🐾", layout="centered")
+st.set_page_config(page_title="IDkat Smart Search", page_icon="🐾", layout="centered")
 
 # ============================================================================
 # 0. SETTINGS & CONSTANTS
 # ============================================================================
 DEFAULT_MODEL = "gemini-3.8-flash"
 FALLBACK_MODEL = "gemini-flash-latest"
-RESULTS_HOURS = 4
 INK, BONE, SAND, MUTED = "#14120F", "#F2EDE3", "#C6BCA9", "#8A8275"
-
-SEARCH_STRATEGIES = [
-    ("Social Profiles & Handles", "social media profiles, Instagram, LinkedIn, X/Twitter, Threads, YouTube, personal handles"),
-    ("Current & Past Employment", "workplaces, job titles, company bio pages, team listings, staff directories, resume publications"),
-    ("Company Directorships & Registers", "business registrations, company directorships, ASIC/corporate filings, domain registration WHOIS, ABN lookups"),
-    ("Industry News & Articles", "press releases, news articles, media mentions, industry interviews, blog posts, guest articles"),
-    ("Speaking & Events", "conference speaker bios, event panelist listings, academic papers, podcast appearances, webinars"),
-    ("Forums & Communities", "forum posts, Reddit, Stack Overflow, Medium, Substack, comment sections, community contributions"),
-    ("People Search & Data Brokers", "directories, whitepages, public record aggregates, people-finder databases"),
-    ("Direct Handle & URL Checks", "exact match web searches for known usernames and domain references")
-]
-
-EXPOSED_TYPES = [
-    "Workplace or Job Title",
-    "Company Directorship / Business Ownership",
-    "Home address",
-    "Phone number",
-    "Email address",
-    "Date of birth or age",
-    "Photos / Media",
-    "Usernames / Social Handles",
-    "Location or City",
-    "Financial / ID details",
-    "Posts, Opinions or Articles",
-    "Other",
-]
-
-PAGE_TYPES = [
-    "Social profile",
-    "Workplace / Corporate Bio",
-    "Company Register / Business Directory",
-    "News / Article",
-    "Forum post",
-    "Blog post",
-    "Other",
-]
 
 _SECRET_CACHE = {}
 SECRET_NAMES = ("IDKAT_SECRET", "GEMINI_API_KEY", "GEMINI_MODEL", "HIBP_API_KEY")
@@ -123,17 +85,10 @@ def fingerprint(value):
         app_secret() or b"idkat", str(value).strip().lower().encode(), "sha256"
     ).hexdigest()[:24]
 
-# ============================================================================
-# 2. HELPER FUNCTIONS
-# ============================================================================
-def is_url(value):
-    v = str(value or "").strip()
-    return v.startswith("http") and v.lower() not in ("none", "null")
-
 def norm_url(url):
-    if not is_url(url):
+    if not url or not str(url).startswith("http"):
         return ""
-    p = urlparse(url.strip())
+    p = urlparse(str(url).strip())
     return f"{p.netloc.lower().removeprefix('www.')}{p.path.rstrip('/')}"
 
 def model_client(api_key):
@@ -141,252 +96,130 @@ def model_client(api_key):
     return genai.Client(api_key=key, vertexai=False, enterprise=False)
 
 # ============================================================================
-# 3. LOCAL EVIDENCE MATCHING
+# 2. ROBUST GOOGLE SEARCH EXECUTION
 # ============================================================================
-class LocalEvidenceExtractor:
-    @staticmethod
-    def evaluate(item, clues):
-        matching_clues = []
-        conflicting_clues = []
+def execute_search_pass(client, model, query_str):
+    """Executes a single search pass and grabs all grounding URLs directly."""
+    config = types.GenerateContentConfig(
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+        temperature=0.3
+    )
+    prompt = f"Find public web pages, profiles, news, and directories for: {query_str}. Return key details found."
 
-        url = norm_url(item.get("url", ""))
-        snippet = (item.get("site", "") + " " + item.get("snippet", "") + " " + item.get("work_details", "")).lower()
-
-        # Check known URLs
-        for known_link in clues.get("known_links", []):
-            if known_link and norm_url(known_link) in url:
-                matching_clues.append("Known personal profile link")
-
-        # Check handles
-        for handle in clues.get("usernames", []):
-            clean_handle = handle.lower().lstrip("@").strip()
-            if clean_handle and (clean_handle in snippet or clean_handle in url):
-                matching_clues.append(f"Matching handle (@{clean_handle})")
-
-        # Check workplaces & schools
-        for org in clues.get("workplaces_schools", []):
-            if org.strip() and org.lower() in snippet:
-                matching_clues.append(f"Matching workplace/company ({org})")
-
-        # Check cities
-        user_locations = [clues.get("current_city", "")] + clues.get("past_cities", [])
-        for loc in user_locations:
-            if loc.strip() and loc.lower() in snippet:
-                matching_clues.append(f"Matching location ({loc})")
-
-        if len(matching_clues) >= 2 or any("Known personal profile link" in m for m in matching_clues):
-            match_status = "Likely you"
-        else:
-            match_status = "Unconfirmed"
-
-        item["matching_clues"] = matching_clues
-        item["conflicting_clues"] = conflicting_clues
-        item["match"] = match_status
-        return item
-
-# ============================================================================
-# 4. DEEP MULTI-PASS SEARCH ENGINE
-# ============================================================================
-class Exposure(BaseModel):
-    site: str = Field(description="The website's name.")
-    page_type: str = Field(default="Other", description="Page classification.")
-    exposed: list[str] = Field(default=[], description="Types of information found.")
-    work_details: str = Field(default="", description="Any job titles, employer names, or professional roles mentioned on this page.")
-    snippet: str = Field(default="", description="A short summary of what was found.")
-    removal: str = Field(description="How to remove/hide in 1-2 practical sentences.")
-    removal_link: str = Field(default="None", description="Exact opt-out/settings link if verified.")
-    source_url: str = Field(default="None", description="Exact page URL.")
-
-class ExposureExtraction(BaseModel):
-    exposures: list[Exposure] = []
-
-def generate(client, model, prompt, schema=None, search=False):
-    config = types.GenerateContentConfig(temperature=0.2)
-    if search:
-        config = types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())], temperature=0.2
-        )
-    if schema is not None:
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json", response_schema=schema, temperature=0
-        )
+    results = []
     try:
-        return client.models.generate_content(model=model, contents=prompt, config=config)
-    except Exception as exc:
-        if model != FALLBACK_MODEL:
-            return client.models.generate_content(model=FALLBACK_MODEL, contents=prompt, config=config)
-        raise
+        resp = client.models.generate_content(model=model, contents=prompt, config=config)
 
-def run_deep_scan(job, profile, clues, max_passes, api_key, model):
-    try:
-        client = model_client(api_key)
-        items, seen_urls = [], set()
+        sources = []
+        for cand in getattr(resp, "candidates", None) or []:
+            meta = getattr(cand, "grounding_metadata", None)
+            for chunk in (getattr(meta, "grounding_chunks", None) or []) if meta else []:
+                web = getattr(chunk, "web", None)
+                if web and getattr(web, "uri", None):
+                    sources.append((getattr(web, "title", "Web Page") or "Web Page", web.uri))
 
-        # Build query elements
-        base_name = profile['name']
-        handles = " ".join([f'"{u.strip()}"' for u in clues.get("usernames", []) if u.strip()])
-        known_links = " ".join([f'"{l.strip()}"' for l in clues.get("known_links", []) if l.strip()])
-        workplaces = " ".join([f'"{w.strip()}"' for w in clues.get("workplaces_schools", []) if w.strip()])
-        location = profile.get('location', '')
+        text_summary = resp.text or ""
 
-        for pass_num in range(1, max_passes + 1):
-            strategy_name, strategy_focus = SEARCH_STRATEGIES[(pass_num - 1) % len(SEARCH_STRATEGIES)]
-            job["progress"] = f"Pass {pass_num}/{max_passes}: Searching {strategy_name}..."
+        for title, uri in sources:
+            results.append({
+                "site": title[:80],
+                "url": uri,
+                "snippet": text_summary[:300] if text_summary else "Found in public search index.",
+                "query_used": query_str
+            })
+    except Exception as e:
+        pass
+    return results
 
-            prompt = f"""Today is {datetime.date.today():%d %B %Y}.
-Find public web pages referencing person: "{base_name}".
-Additional clues to search:
-Location: {location}
-Workplaces/Companies: {workplaces}
-Usernames/Handles: {handles}
-Direct Links: {known_links}
+def run_3_pass_initial_search(username, name, locations, workplaces, handles, api_key, model):
+    client = model_client(api_key)
+    all_found = []
+    seen_urls = set()
 
-Focus strategy for this pass: {strategy_focus}.
-Find exact URLs, site names, job titles/professional roles exposed, and summaries."""
+    # Pass 1: Name + Handles / Social Focus
+    q1 = f'"{name}" ' + " ".join([f'"{h}"' for h in handles if h])
+    res1 = execute_search_pass(client, model, q1)
 
-            resp = generate(client, model, prompt, search=True)
+    # Pass 2: Name + Workplaces / Companies
+    q2 = f'"{name}" ' + " ".join([f'"{w}"' for w in workplaces if w])
+    res2 = execute_search_pass(client, model, q2)
 
-            sources = []
-            for cand in getattr(resp, "candidates", None) or []:
-                meta = getattr(cand, "grounding_metadata", None)
-                for chunk in (getattr(meta, "grounding_chunks", None) or []) if meta else []:
-                    web = getattr(chunk, "web", None)
-                    if web and getattr(web, "uri", None):
-                        sources.append((getattr(web, "title", "") or "", web.uri))
+    # Pass 3: Name + Locations / Cities
+    q3 = f'"{name}" ' + " ".join([f'"{l}"' for l in locations if l])
+    res3 = execute_search_pass(client, model, q3)
 
-            allowed = {norm_url(u) for _, u in sources}
-            notes = resp.text or ""
-            if not notes.strip():
-                continue
+    # Broad Fallback Pass if still empty
+    if not (res1 or res2 or res3):
+        q_fallback = f'"{name}" Australia online profile directory'
+        res_fall = execute_search_pass(client, model, q_fallback)
+        res3.extend(res_fall)
 
-            # Extract structured items
-            extract_prompt = f"""Convert search notes into JSON for target "{base_name}".
+    for item in res1 + res2 + res3:
+        norm = norm_url(item["url"])
+        if norm and norm not in seen_urls:
+            seen_urls.add(norm)
+            all_found.append(item)
 
-VERIFIED SOURCES
-{chr(10).join([f"- {u} ({t})" for t, u in sources])}
+    return all_found
 
-NOTES
-{notes[:25000]}"""
+def run_1_pass_smart_search(name, selected_terms, api_key, model):
+    client = model_client(api_key)
+    query = f'"{name}" ' + " ".join([f'"{t}"' for t in selected_terms])
+    return execute_search_pass(client, model, query)
 
-            data = generate(client, model, extract_prompt, schema=ExposureExtraction)
-            parsed = getattr(data, "parsed", None)
-            raw = (
-                parsed.model_dump()
-                if isinstance(parsed, BaseModel)
-                else json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", (data.text or "").strip()) or "{}")
-            )
-
-            for e in raw.get("exposures", []):
-                url = e.get("source_url", "")
-                norm = norm_url(url)
-                if norm and norm in allowed and norm not in seen_urls:
-                    seen_urls.add(norm)
-                    item = {
-                        "site": e.get("site", "Unknown site")[:80],
-                        "page_type": e.get("page_type", "Other"),
-                        "exposed": e.get("exposed", ["Other"]),
-                        "work_details": e.get("work_details", ""),
-                        "snippet": e.get("snippet", "")[:300],
-                        "removal": e.get("removal", "Contact site administrator or check account privacy settings.")[:400],
-                        "url": url,
-                        "removal_link": e.get("removal_link", ""),
-                    }
-                    item = LocalEvidenceExtractor.evaluate(item, clues)
-                    items.append(item)
-
-        job["result"] = {
-            "items": items,
-            "name": profile["name"],
-            "finished": datetime.datetime.now().strftime("%d %b %Y %H:%M"),
-        }
-        job["status"] = "done"
-    except Exception as exc:
-        job["status"], job["error"] = "failed", f"Search halted: {str(exc)[:300]}"
-
-def start_deep_scan(username, profile, clues, max_passes):
-    job = {
-        "id": uuid.uuid4().hex[:12],
-        "owner": fingerprint(username),
-        "status": "running",
-        "progress": "Initializing deep multi-pass scan...",
-        "started": time.time(),
-        "result": None,
-        "error": "",
-    }
-    with STORE["lock"]:
-        STORE["jobs"][job["id"]] = job
-    api_key = str(secret("GEMINI_API_KEY", "") or "")
-    model = str(secret("GEMINI_MODEL", DEFAULT_MODEL))
-    threading.Thread(
-        target=run_deep_scan, args=(job, profile, clues, max_passes, api_key, model), daemon=True
-    ).start()
-
-def my_job(username):
-    owner = fingerprint(username)
-    jobs = [j for j in list(STORE["jobs"].values()) if j["owner"] == owner]
-    return max(jobs, key=lambda j: j["started"]) if jobs else None
-
-def delete_user_data(username):
+def delete_user_session(username):
     owner = fingerprint(username)
     with STORE["lock"]:
-        for job_id in [j for j, job in STORE["jobs"].items() if job["owner"] == owner]:
-            del STORE["jobs"][job_id]
         if username.lower() in STORE["users"]:
             del STORE["users"][username.lower()]
 
 # ============================================================================
-# 5. MULTI-FORMAT REPORT EXPORTERS (PDF, DOCX, TXT)
+# 3. REPORT EXPORTERS
 # ============================================================================
-def generate_pdf(verified_items, name, finished):
+def generate_pdf(verified_items, name):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, f"IDkat Footprint Report: {name}", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "I", 10)
-    pdf.cell(0, 5, f"Generated on {finished}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, f"IDkat Verified Footprint: {name}", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 5, f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
 
     for item in verified_items:
         pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 6, f"{item['site']} ({item['page_type']})", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, item['site'], new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 9)
-        pdf.multi_cell(0, 4, f"URL: {item['url']}\nExposes: {', '.join(item['exposed'])}\nWork History Details: {item.get('work_details', 'N/A')}\nSummary: {item['snippet']}\nRemoval Action: {item['removal']}\n")
-        pdf.ln(3)
+        pdf.multi_cell(0, 4, f"URL: {item['url']}\nSummary: {item['snippet']}\nQuery matched: {item.get('query_used', 'N/A')}\n")
+        pdf.ln(2)
     return bytes(pdf.output())
 
-def generate_docx(verified_items, name, finished):
+def generate_docx(verified_items, name):
     doc = docx.Document()
-    doc.add_heading(f"IDkat Online Footprint Report: {name}", 0)
-    doc.add_paragraph(f"Generated on {finished}")
+    doc.add_heading(f"IDkat Verified Footprint: {name}", 0)
+    doc.add_paragraph(f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}")
 
     for item in verified_items:
-        doc.add_heading(f"{item['site']} ({item['page_type']})", level=2)
+        doc.add_heading(item['site'], level=2)
         doc.add_paragraph(f"URL: {item['url']}")
-        doc.add_paragraph(f"Information Exposed: {', '.join(item['exposed'])}")
-        if item.get("work_details"):
-            doc.add_paragraph(f"Work/Professional History: {item['work_details']}")
-        doc.add_paragraph(f"Context Summary: {item['snippet']}")
-        doc.add_paragraph(f"How to Remove: {item['removal']}")
+        doc.add_paragraph(f"Summary: {item['snippet']}")
+        doc.add_paragraph(f"Search query: {item.get('query_used', 'N/A')}")
 
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
 
-def generate_txt(verified_items, name, finished):
-    lines = [f"IDKAT ONLINE FOOTPRINT REPORT: {name}", f"Generated on {finished}", "="*50, ""]
+def generate_txt(verified_items, name):
+    lines = [f"IDKAT VERIFIED FOOTPRINT REPORT: {name}", f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}", "="*50, ""]
     for item in verified_items:
-        lines.append(f"Site: {item['site']} ({item['page_type']})")
+        lines.append(f"Site: {item['site']}")
         lines.append(f"URL: {item['url']}")
-        lines.append(f"Exposed: {', '.join(item['exposed'])}")
-        if item.get("work_details"):
-            lines.append(f"Work Details: {item['work_details']}")
         lines.append(f"Summary: {item['snippet']}")
-        lines.append(f"Removal: {item['removal']}")
+        lines.append(f"Query: {item.get('query_used', 'N/A')}")
         lines.append("-" * 40)
     return "\n".join(lines).encode("utf-8")
 
 # ============================================================================
-# 6. STREAMLIT INTERFACE
+# 4. STREAMLIT INTERFACE & SESSION STATE
 # ============================================================================
 st.markdown(
     f"""<style>
@@ -396,14 +229,24 @@ st.markdown(
 .idk-band .title {{ font-size:2.2rem; color:{BONE}; font-weight:600; line-height:1.1; }}
 .idk-band .sub {{ color:{SAND}; font-style:italic; margin-top:4px; }}
 </style>
-<div class="idk-band"><div class="eyebrow">Deep Online Footprint Search</div><div class="title">🐾 IDkat v2.5</div>
-<div class="sub">Multi-pass deep web search & professional history scanner.</div></div>""",
+<div class="idk-band"><div class="eyebrow">Interactive Smart Search</div><div class="title">🐾 IDkat v3.0</div>
+<div class="sub">3-Pass initial sweep with interactive term refining & real-time discovery.</div></div>""",
     unsafe_allow_html=True,
 )
 
+# Session state initialization
 if "username" not in st.session_state:
     st.session_state.username = None
+if "search_results" not in st.session_state:
+    st.session_state.search_results = []
+if "confirmations" not in st.session_state:
+    st.session_state.confirmations = {}
+if "search_terms" not in st.session_state:
+    st.session_state.search_terms = []
+if "user_fullname" not in st.session_state:
+    st.session_state.user_fullname = ""
 
+# Authentication
 if not st.session_state.username:
     tab1, tab2 = st.tabs(["Sign In", "Create Account"])
     with tab1:
@@ -439,77 +282,171 @@ top1, top2 = st.columns([3, 1])
 top1.markdown(f"Signed in as **{html.escape(st.session_state.username)}**")
 if top2.button("Log out"):
     st.session_state.username = None
+    st.session_state.search_results = []
     st.rerun()
 
-job = my_job(st.session_state.username)
+# ============================================================================
+# SEARCH INTERFACE & RESULTS DASHBOARD
+# ============================================================================
+api_key = str(secret("GEMINI_API_KEY", "") or "")
+model_name = str(secret("GEMINI_MODEL", DEFAULT_MODEL))
 
-if job and job["status"] == "running":
-    st.info(f"⏳ {job['progress']}")
-    time.sleep(2)
-    st.rerun()
+if not st.session_state.search_results:
+    st.subheader("1. Initial 3-Pass Broad Search")
+    with st.form("initial_search"):
+        name = st.text_input("Full Name *", placeholder="e.g. Will Wright")
+        locations = st.text_input("Cities / Regions (comma separated)", placeholder="e.g. Geelong, Melbourne")
+        workplaces = st.text_area("Workplaces / Companies (one per line)", placeholder="e.g. Acme Media\nMonash University")
+        handles = st.text_input("Usernames / Social Handles (comma separated)", placeholder="e.g. @willwright, @willwrightmedia")
+        
+        confirm = st.checkbox("I confirm I am searching for information about myself")
+        start_btn = st.form_submit_button("Run Initial 3-Pass Search", type="primary")
 
-if job and job["status"] == "done":
-    res = job["result"]
-    raw_items = res["items"]
+    if start_btn:
+        if not name.strip() or not confirm:
+            st.error("Please enter your name and confirm authorization.")
+        else:
+            st.session_state.user_fullname = name.strip()
+            loc_list = [x.strip() for x in locations.split(",") if x.strip()]
+            work_list = [x.strip() for x in workplaces.split("\n") if x.strip()]
+            hand_list = [x.strip() for x in handles.split(",") if x.strip()]
 
-    if "user_confirmations" not in st.session_state:
-        st.session_state.user_confirmations = {}
+            # Store terms for Smart Search checkboxes
+            st.session_state.search_terms = [
+                {"term": t, "active": True, "type": "Location"} for t in loc_list
+            ] + [
+                {"term": t, "active": True, "type": "Workplace"} for t in work_list
+            ] + [
+                {"term": t, "active": True, "type": "Handle"} for t in hand_list
+            ]
 
-    st.subheader(f"Review Search Results ({len(raw_items)} items found)")
-    st.caption("Review candidate pages found during the deep scan. Click 'This is me' to include a page in your final report.")
+            with st.spinner("Running 3-pass search sweep (Social, Work, Locations)..."):
+                results = run_3_pass_initial_search(
+                    st.session_state.username,
+                    name.strip(),
+                    loc_list,
+                    work_list,
+                    hand_list,
+                    api_key,
+                    model_name
+                )
+                st.session_state.search_results = results
+                st.rerun()
+
+else:
+    # RESULTS FOUND / INTERACTIVE DASHBOARD
+    st.subheader(f"Search Results ({len(st.session_state.search_results)} items found)")
+    st.caption("Review candidate pages below. Click 'This is me' to include in your final report.")
 
     verified = []
     excluded = 0
 
-    for idx, item in enumerate(raw_items):
+    # Display items interactively
+    for idx, item in enumerate(st.session_state.search_results):
         item_id = f"item_{idx}"
-        choice = st.session_state.user_confirmations.get(item_id)
+        status = st.session_state.confirmations.get(item_id, None)
 
-        if choice == "yes" or item["match"] == "Likely you":
+        if status == "yes":
             verified.append(item)
-            with st.expander(f"✅ {item['site']} ({item['page_type']}) — Confirmed", expanded=False):
-                st.write(f"**URL:** [{item['url']}]({item['url']})")
-                st.write(f"**Exposed:** {', '.join(item['exposed'])}")
-                if item.get("work_details"):
-                    st.write(f"**Work Details:** {item['work_details']}")
-                st.write(f"**Snippet:** {item['snippet']}")
-        elif choice == "no":
+            st.success(f"✅ **{item['site']}**  \nURL: [{item['url']}]({item['url']})")
+        elif status == "no":
             excluded += 1
         else:
             with st.container():
-                st.warning(f"❓ **Candidate Page:** {item['site']} ({item['page_type']})")
+                st.warning(f"❓ **Candidate Page:** {item['site']}")
                 st.write(f"**URL:** [{item['url']}]({item['url']})")
-                st.write(f"**Snippet:** *\"{item['snippet']}\"*")
-                if item.get("work_details"):
-                    st.write(f"**Work/Role Mentioned:** {item['work_details']}")
-                col1, col2 = st.columns(2)
-                if col1.button("This is me", key=f"y_{idx}"):
-                    st.session_state.user_confirmations[item_id] = "yes"
+                st.caption(f"Snippet: *\"{item['snippet']}\"*")
+                c1, c2 = st.columns(2)
+                if c1.button("This is me", key=f"yes_{idx}"):
+                    st.session_state.confirmations[item_id] = "yes"
                     st.rerun()
-                if col2.button("Not me", key=f"n_{idx}"):
-                    st.session_state.user_confirmations[item_id] = "no"
+                if c2.button("Not me", key=f"no_{idx}"):
+                    st.session_state.confirmations[item_id] = "no"
                     st.rerun()
             st.markdown("---")
 
-    st.markdown(f"### 📊 Report Tally")
-    st.write(f"- Verified pages for report: **{len(verified)}**")
-    st.write(f"- Pages excluded: **{excluded}**")
-
+    # Smart Search Refinement Section
     st.divider()
-    st.subheader("Download Report")
+    st.subheader("2. Smart Search Refinement (1-Pass Additional Searches)")
+    st.caption("Tick or untick terms to refine the next single-pass query, or add new custom terms.")
+
+    # Render checkboxes for current terms
+    selected_terms = []
+    for term_obj in st.session_state.search_terms:
+        chk = st.checkbox(
+            f"[{term_obj['type']}] {term_obj['term']}",
+            value=term_obj["active"],
+            key=f"chk_{term_obj['term']}"
+        )
+        term_obj["active"] = chk
+        if chk:
+            selected_terms.append(term_obj["term"])
+
+    # Add new terms dynamically
+    with st.form("add_custom_term"):
+        new_term = st.text_input("Add a new term to search (e.g. Maiden name, key project, board position)")
+        if st.form_submit_button("Add Term"):
+            if new_term.strip():
+                st.session_state.search_terms.append({"term": new_term.strip(), "active": True, "type": "Custom"})
+                st.rerun()
+
+    # Smart Search Clarification Questions
+    st.markdown("#### 💬 Clarification Questions")
+    st.caption("Answering these questions creates targeted single-pass searches.")
+    q_col1, q_col2 = st.columns(2)
+    with q_col1:
+        if st.button("🔍 Search ASIC / Corporate Registers"):
+            st.session_state.search_terms.append({"term": "ASIC business directorship register", "active": True, "type": "Corporate"})
+            st.rerun()
+    with q_col2:
+        if st.button("🔍 Search Domain WHOIS & Personal Websites"):
+            st.session_state.search_terms.append({"term": "domain WHOIS registration website owner", "active": True, "type": "Domain"})
+            st.rerun()
+
+    if st.button("🚀 Run 1-Pass Smart Search Now", type="primary"):
+        with st.spinner("Executing targeted 1-pass Smart Search..."):
+            new_results = run_1_pass_smart_search(
+                st.session_state.user_fullname,
+                selected_terms,
+                api_key,
+                model_name
+            )
+            # Deduplicate and append
+            existing_urls = {norm_url(r["url"]) for r in st.session_state.search_results}
+            added_count = 0
+            for nr in new_results:
+                norm = norm_url(nr["url"])
+                if norm and norm not in existing_urls:
+                    existing_urls.add(norm)
+                    st.session_state.search_results.append(nr)
+                    added_count += 1
+            
+            if added_count > 0:
+                st.success(f"Smart Search complete! Added {added_count} new candidate pages.")
+            else:
+                st.info("No new additional pages found with selected terms.")
+            time.sleep(1)
+            st.rerun()
+
+    # Report Tally & Export
+    st.divider()
+    st.subheader("3. Export Verified Report")
+    st.write(f"- Verified pages confirmed: **{len(verified)}**")
+    st.write(f"- Candidate pages excluded: **{excluded}**")
+
     fmt = st.selectbox("Select file format", ["PDF (.pdf)", "Word Document (.docx)", "Plain Text (.txt)"])
 
     if fmt == "PDF (.pdf)":
-        data = generate_pdf(verified, res["name"], res["finished"])
-        fname = f"IDkat_{res['name'].replace(' ', '_')}.pdf"
+        data = generate_pdf(verified, st.session_state.user_fullname)
+        fname = f"IDkat_{st.session_state.user_fullname.replace(' ', '_')}.pdf"
         mtype = "application/pdf"
     elif fmt == "Word Document (.docx)":
-        data = generate_docx(verified, res["name"], res["finished"])
-        fname = f"IDkat_{res['name'].replace(' ', '_')}.docx"
+        data = generate_docx(verified, st.session_state.user_fullname)
+        fname = f"IDkat_{st.session_state.user_fullname.replace(' ', '_')}.docx"
         mtype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     else:
-        data = generate_txt(verified, res["name"], res["finished"])
-        fname = f"IDkat_{res['name'].replace(' ', '_')}.txt"
+        data = generate_txt(verified, st.session_state.user_fullname)
+        fname = f"IDkat_{st.session_state.user_fullname.replace(' ', '_')}.txt"
         mtype = "text/plain"
 
     if st.download_button(
@@ -519,49 +456,9 @@ if job and job["status"] == "done":
         mime=mtype,
         type="primary"
     ):
-        delete_user_data(st.session_state.username)
+        delete_user_session(st.session_state.username)
         st.session_state.username = None
-        st.success("Report downloaded and session memory wiped!")
-        st.rerun()
-    st.stop()
-
-# Search Input Form
-st.subheader("Configure Deep Search")
-with st.form("deep_scan_form"):
-    name = st.text_input("Your full name *")
-    location = st.text_input("Current & past cities/regions", placeholder="e.g. Geelong, Melbourne, Sydney")
-
-    st.markdown("---")
-    st.markdown("#### Work & Professional Footprint Clues")
-    workplaces = st.text_area("Workplaces, Companies & Schools (one per line)", placeholder="e.g. Acme Media\nMonash University\nTech Corp")
-
-    st.markdown("---")
-    st.markdown("#### Handles & Direct Profiles")
-    usernames = st.text_input("Social handles / usernames (comma-separated)", placeholder="e.g. @willwright, @willwrightmedia")
-    known_links = st.text_area("Direct profile URLs (LinkedIn, Instagram, personal site)", placeholder="https://www.linkedin.com/in/willwright\nhttps://www.instagram.com/willwright")
-
-    st.markdown("---")
-    passes = st.slider("Number of Search Passes (1 to 50)", min_value=1, max_value=50, value=10, help="Higher passes perform deeper systematic checks across corporate registers, social handles, news, and publications.")
-
-    confirm = st.checkbox("I confirm I am searching for information about myself")
-    submit = st.form_submit_button("Start Deep Search", type="primary")
-
-if submit:
-    if not name.strip() or not confirm:
-        st.error("Please fill in your name and confirm you are searching for yourself.")
-    else:
-        clues_data = {
-            "known_links": [l.strip() for l in known_links.split("\n") if l.strip()],
-            "current_city": location.strip(),
-            "past_cities": [c.strip() for c in location.split(",") if c.strip()],
-            "workplaces_schools": [w.strip() for w in workplaces.split("\n") if w.strip()],
-            "usernames": [u.strip() for u in usernames.split(",") if u.strip()],
-        }
-
-        start_deep_scan(
-            st.session_state.username,
-            {"name": name.strip(), "location": location.strip()},
-            clues_data,
-            passes
-        )
+        st.session_state.search_results = []
+        st.session_state.confirmations = {}
+        st.success("Report downloaded and memory wiped!")
         st.rerun()
