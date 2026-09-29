@@ -1,9 +1,9 @@
 """
-IDkat: Privacy & Media Intelligence Tool with Admin Analytics
+IDkat: Privacy & Media Intelligence Tool (Kat Brand Family)
 
-- Persistent user accounts & profile library.
-- Admin dashboard (`katadmin`) with privacy-safe metrics for advertising/monetization.
-- Full analytics tracking: logins, report downloads, active sessions, and churn audit logs.
+- Kat Family Meerkat branding & unified design palette (matching Medierkat & Markat).
+- Persistent user accounts, profile library, and admin dashboard (`katadmin`).
+- Privacy-safe advertiser & engagement analytics.
 - Automatic SQLite migration & database persistence across app updates.
 """
 
@@ -28,7 +28,7 @@ from fpdf import FPDF
 from google import genai
 from google.genai import types
 
-st.set_page_config(page_title="IDkat", page_icon="🐾", layout="centered")
+st.set_page_config(page_title="IDkat", page_icon="🦦", layout="centered")
 
 # ============================================================================
 # 0. SETTINGS & CONSTANTS
@@ -315,7 +315,7 @@ def run_3_pass_search(name, locations, workplaces, handles, api_key, model):
     all_found = []
     seen_urls = set()
 
-    progress_bar = st.progress(0, text="Starting 3-Pass Search...")
+    progress_bar = st.progress(0, text="Starting Kat 3-Pass Search...")
 
     progress_bar.progress(20, text="Pass 1/3: Checking social profiles and handles...")
     q1 = f'"{name}" ' + " ".join([f'"{h}"' for h in handles if h])
@@ -334,7 +334,7 @@ def run_3_pass_search(name, locations, workplaces, handles, api_key, model):
         q_fallback = f'"{name}" online profile'
         res3.extend(execute_search_pass(client, model, q_fallback))
 
-    progress_bar.progress(100, text="Search Complete!")
+    progress_bar.progress(100, text="Kat Search Complete!")
     time.sleep(0.5)
     progress_bar.empty()
 
@@ -448,20 +448,20 @@ def generate_txt(verified_items, name, synthesis=""):
     return "\n".join(lines).encode("utf-8")
 
 # ============================================================================
-# 4. STREAMLIT INTERFACE & ADMIN DASHBOARD
+# 4. STREAMLIT INTERFACE & BRANDING (MEERKAT & KAT FAMILY)
 # ============================================================================
 st.markdown(
     f"""<style>
 .stApp {{ background:{INK}; color:{BONE}; }}
-.idk-band {{ background:#1A1814; border:1px solid #2C2822; padding:22px 26px; margin-bottom:16px; }}
-.idk-band .eyebrow {{ font-size:0.72rem; letter-spacing:0.22em; color:{MUTED}; text-transform:uppercase; }}
-.idk-band .title {{ font-size:2.2rem; color:{BONE}; font-weight:600; line-height:1.1; }}
-.idk-band .sub {{ color:{SAND}; font-style:normal; margin-top:6px; font-size:1.0rem; }}
+.idk-band {{ background:#1A1814; border:1px solid #2C2822; padding:22px 26px; margin-bottom:16px; border-radius:6px; }}
+.idk-band .eyebrow {{ font-size:0.72rem; letter-spacing:0.22em; color:{MUTED}; text-transform:uppercase; font-weight:600; }}
+.idk-band .title {{ font-size:2.3rem; color:{BONE}; font-weight:700; line-height:1.1; display:flex; align-items:center; gap:10px; }}
+.idk-band .sub {{ color:{SAND}; font-style:normal; margin-top:6px; font-size:1.0rem; line-height:1.4; }}
 </style>
 <div class="idk-band">
-  <div class="eyebrow">Privacy & Media Intelligence Tool</div>
-  <div class="title">🐾 IDkat</div>
-  <div class="sub">Find where your personal information appears online, review what's exposed, and export a synthesized intelligence report. All your data is retained in your account library.</div>
+  <div class="eyebrow">Kat Brand Family · Privacy & Intelligence</div>
+  <div class="title">🦦 IDkat</div>
+  <div class="sub">Find where your personal information appears online, review what's exposed, and export a synthesized intelligence report. Powered by the Kat media intelligence engine.</div>
 </div>""",
     unsafe_allow_html=True,
 )
@@ -547,9 +547,9 @@ if not st.session_state.username:
 # Check Admin Status
 is_admin = (st.session_state.username.lower() == ADMIN_USERNAME)
 
-# Sidebar
+# Sidebar Navigation
 with st.sidebar:
-    st.title("👤 Account")
+    st.title("🦦 Kat Account")
     st.write(f"Logged in: **{st.session_state.username}** {'(Admin)' if is_admin else ''}")
     
     if st.button("Log out", width="stretch"):
@@ -579,7 +579,7 @@ with st.sidebar:
                     st.rerun()
                 st.markdown("---")
         else:
-            st.caption("No saved profiles in your library yet.")
+            st.caption("No saved profiles in your Kat library yet.")
 
         st.divider()
         with st.expander("Danger Zone"):
@@ -596,10 +596,10 @@ model_name = str(secret("GEMINI_MODEL", DEFAULT_MODEL))
 # ADMIN PANEL VIEW (Only visible to katadmin)
 # ============================================================================
 if is_admin:
-    st.subheader("⚙️ Admin Analytics & User Management")
-    st.caption("Platform analytics and privacy-safe user metrics for media & advertiser insights.")
+    st.subheader("⚙️ Kat Platform Admin & Media Analytics")
+    st.caption("Platform metrics, user audits, and advertiser audience insights.")
 
-    tab_a1, tab_a2, tab_a3 = st.tabs(["📊 Analytics & Media Metrics", "👥 User List & Sessions", "💾 Database Backup"])
+    tab_a1, tab_a2, tab_a3 = st.tabs(["📊 Analytics & Advertiser Reach", "👥 User Audit & Sessions", "💾 Database Backup"])
 
     with get_db() as conn:
         total_users = conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = 0").fetchone()[0]
@@ -616,8 +616,8 @@ if is_admin:
         m4.metric("Reports Generated", total_reports)
 
         st.divider()
-        st.markdown("#### 🎯 Aggregated Demographic & Regional Reach (For Advertisers)")
-        st.caption("Aggregated locations extracted from saved profiles without identifying individual users.")
+        st.markdown("#### 🎯 Audience Regional Breakdown (For Kat Advertisers)")
+        st.caption("Aggregated regional reach compiled from saved user profiles without individual identification.")
         
         with get_db() as conn:
             loc_rows = conn.execute("SELECT locations FROM user_profiles WHERE locations != ''").fetchall()
@@ -629,14 +629,14 @@ if is_admin:
         if all_locs:
             from collections import Counter
             counts = Counter(all_locs).most_common(10)
-            st.write("**Top Target Audience Regions:**")
+            st.write("**Top Audience Regions:**")
             for loc, count in counts:
                 st.markdown(f"- **{loc}**: {count} profile(s)")
         else:
             st.info("No location demographic data compiled yet.")
 
     with tab_a2:
-        st.markdown("#### User Accounts Audit")
+        st.markdown("#### User Accounts Audit Log")
         with get_db() as conn:
             user_list = conn.execute("SELECT username, created_at, last_login FROM users WHERE is_admin = 0 ORDER BY created_at DESC").fetchall()
         
@@ -655,7 +655,7 @@ if is_admin:
             st.info("No registered users yet.")
 
         st.divider()
-        st.markdown("#### Account Churn Audit Log")
+        st.markdown("#### Churn Audit Log")
         with get_db() as conn:
             audit_list = conn.execute("SELECT username, action, timestamp FROM audit_logs ORDER BY timestamp DESC LIMIT 20").fetchall()
         
@@ -668,7 +668,7 @@ if is_admin:
             st.dataframe(a_data, width="stretch")
 
     with tab_a3:
-        st.markdown("#### Database Backup & Deployment Safeguard")
+        st.markdown("#### Database Safeguard & Backup")
         st.caption("Download a copy of the SQLite database before pushing code updates to GitHub or Streamlit Cloud.")
         
         if Path(DB_FILE).exists():
@@ -698,7 +698,7 @@ if not st.session_state.search_results:
         
         save_to_lib = st.checkbox("Save this profile to my library for future runs", value=True)
         confirm = st.checkbox("I confirm I am searching for information about myself")
-        start_btn = st.form_submit_button("Run 3-Pass Search", type="primary")
+        start_btn = st.form_submit_button("Run Kat 3-Pass Search", type="primary")
 
     if start_btn:
         if not name.strip() or not confirm:
@@ -825,7 +825,7 @@ else:
 
     # Smart Search Refinement
     st.divider()
-    st.subheader("3. Refine Search")
+    st.subheader("3. Refine Kat Search")
     st.caption("Tick or untick details below to refine your next single-pass search, or add custom terms.")
 
     selected_terms = []
@@ -884,7 +884,7 @@ else:
             )
             st.rerun()
 
-    if st.button("🚀 Run 1-Pass Search Extension"):
+    if st.button("🚀 Run 1-Pass Kat Search Extension"):
         with st.spinner("Searching for additional pages..."):
             client = model_client(api_key)
             query = f'"{st.session_state.user_fullname}" ' + " ".join([f'"{t}"' for t in selected_terms])
@@ -916,7 +916,7 @@ else:
             st.rerun()
 
     st.divider()
-    st.subheader("4. Export Report")
+    st.subheader("4. Export Kat Report")
     st.write(f"- Pages verified for report: **{len(verified)}**")
     st.write(f"- Pages excluded: **{excluded}**")
 
@@ -947,5 +947,5 @@ else:
         st.session_state.search_results = []
         st.session_state.confirmations = {}
         st.session_state.synthesis = ""
-        st.success("Report downloaded! Active search session cleared (your account and saved profiles remain in your library).")
+        st.success("Report downloaded! Active search session cleared (your account and saved profiles remain in your Kat library).")
         st.rerun()
