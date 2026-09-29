@@ -1,10 +1,10 @@
 """
 IDkat: Find and remove your personal details online.
 
-- Create an account and search the web for where your information appears.
-- Review candidate pages interactively and refine results with Smart Search.
-- Export verified results to PDF, Word, or Text.
-- Downloaded reports immediately delete all your data from IDkat.
+- Create an account and save personal search profiles to your library.
+- Synthesizes search findings into executive media & privacy intelligence reports.
+- Downloads export reports while keeping your login and profile library intact.
+- Full account deletion remains available at any time.
 """
 
 import datetime
@@ -35,7 +35,7 @@ st.set_page_config(page_title="IDkat", page_icon="🐾", layout="centered")
 # ============================================================================
 DEFAULT_MODEL = "gemini-3.8-flash"
 FALLBACK_MODEL = "gemini-flash-latest"
-SESSION_HOURS = 24
+SESSION_HOURS = 168  # 7-day persistent login sessions
 DB_FILE = "idkat_db.sqlite"
 INK, BONE, SAND, MUTED = "#14120F", "#F2EDE3", "#C6BCA9", "#8A8275"
 
@@ -58,7 +58,7 @@ def app_secret():
     return value.encode() if len(value) >= 32 else b""
 
 # ============================================================================
-# 1. DATABASE STORAGE
+# 1. DATABASE STORAGE (PERSISTENT ACCOUNTS & PROFILE LIBRARY)
 # ============================================================================
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -83,12 +83,26 @@ def init_db():
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_data (
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                profile_id TEXT PRIMARY KEY,
+                username TEXT,
+                profile_name TEXT,
+                fullname TEXT,
+                locations TEXT,
+                workplaces TEXT,
+                handles TEXT,
+                created_at REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS active_workspace (
                 username TEXT PRIMARY KEY,
+                profile_id TEXT,
                 user_fullname TEXT,
                 search_results TEXT,
                 confirmations TEXT,
-                search_terms TEXT
+                search_terms TEXT,
+                synthesis TEXT
             )
         """)
         conn.commit()
@@ -148,42 +162,73 @@ def destroy_session():
             conn.commit()
     st.query_params.clear()
 
-def save_user_state(username, fullname, results, confirmations, terms):
+# Profile Management
+def save_profile(username, profile_name, fullname, locations, workplaces, handles):
+    profile_id = pysecrets.token_hex(8)
     with get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO user_data VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO user_profiles VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (profile_id, username, profile_name, fullname, locations, workplaces, handles, time.time())
+        )
+        conn.commit()
+    return profile_id
+
+def get_user_profiles(username):
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM user_profiles WHERE username = ? ORDER BY created_at DESC", (username,)).fetchall()
+
+def delete_profile(profile_id):
+    with get_db() as conn:
+        conn.execute("DELETE FROM user_profiles WHERE profile_id = ?", (profile_id,))
+        conn.commit()
+
+# Workspace Management
+def save_workspace(username, profile_id, fullname, results, confirmations, terms, synthesis=""):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO active_workspace VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 username,
+                profile_id,
                 fullname,
                 json.dumps(results),
                 json.dumps(confirmations),
                 json.dumps(terms),
+                synthesis,
             )
         )
         conn.commit()
 
-def load_user_state(username):
+def load_workspace(username):
     with get_db() as conn:
-        row = conn.execute("SELECT * FROM user_data WHERE username = ?", (username,)).fetchone()
+        row = conn.execute("SELECT * FROM active_workspace WHERE username = ?", (username,)).fetchone()
         if row:
             return {
+                "profile_id": row["profile_id"],
                 "fullname": row["user_fullname"],
                 "results": json.loads(row["search_results"]),
                 "confirmations": json.loads(row["confirmations"]),
                 "terms": json.loads(row["search_terms"]),
+                "synthesis": row["synthesis"] if "synthesis" in row.keys() else "",
             }
     return None
 
-def delete_user_permanently(username):
+def clear_workspace(username):
+    with get_db() as conn:
+        conn.execute("DELETE FROM active_workspace WHERE username = ?", (username,))
+        conn.commit()
+
+def delete_entire_account(username):
     with get_db() as conn:
         conn.execute("DELETE FROM users WHERE username = ?", (username,))
-        conn.execute("DELETE FROM user_data WHERE username = ?", (username,))
+        conn.execute("DELETE FROM user_profiles WHERE username = ?", (username,))
+        conn.execute("DELETE FROM active_workspace WHERE username = ?", (username,))
         conn.execute("DELETE FROM sessions WHERE username = ?", (username,))
         conn.commit()
     destroy_session()
 
 # ============================================================================
-# 2. SEARCH ENGINE EXECUTION
+# 2. SEARCH & SYNTHESIS ENGINE
 # ============================================================================
 def execute_search_pass(client, model, query_str):
     config = types.GenerateContentConfig(
@@ -253,11 +298,33 @@ def run_3_pass_search(name, locations, workplaces, handles, api_key, model):
 
     return all_found
 
+def synthesize_report_intelligence(name, verified_items, api_key, model):
+    client = model_client(api_key)
+    item_context = "\n".join([f"- Site: {i['site']} | URL: {i['url']} | Context: {i['snippet']}" for i in verified_items])
+
+    prompt = f"""You are a media intelligence and privacy compliance analyst. Analyze the following verified online web findings for person: "{name}".
+
+FINDINGS:
+{item_context}
+
+Provide a structured, executive-level intelligence synthesis with 4 sections:
+1. EXECUTIVE SUMMARY & PUBLIC FOOTPRINT NARRATIVE: What does this collection of information convey about the person's professional and public persona?
+2. PRIVACY & EXPOSURE RISKS: Are there any specific privacy, safety, or identity risks (e.g. historical affiliations, contact info leakage, profile mixing)?
+3. RECOMMENDED ACTIONS: Bullet points on specific steps to take (e.g. content removal requests, privacy setting toggles, account closures).
+4. STRATEGIC RECOMMENDATIONS: Forward-looking advice to protect digital footprint and manage online reputation.
+
+Keep the language professional, direct, and actionable."""
+
+    try:
+        resp = client.models.generate_content(model=model, contents=prompt)
+        return resp.text or "Synthesis could not be generated."
+    except Exception as e:
+        return f"Synthesis error: {str(e)}"
+
 # ============================================================================
 # 3. UNICODE SAFE REPORT EXPORTERS
 # ============================================================================
 def clean_pdf_text(text):
-    """Sanitizes text to prevent FPDFUnicodeEncodingException on standard Latin-1 canvas."""
     if not text:
         return ""
     replacements = {
@@ -269,17 +336,26 @@ def clean_pdf_text(text):
         text = text.replace(k, v)
     return text.encode("latin-1", "replace").decode("latin-1")
 
-def generate_pdf(verified_items, name):
+def generate_pdf(verified_items, name, synthesis=""):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, clean_pdf_text(f"IDkat Footprint Report: {name}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, clean_pdf_text(f"IDkat Media & Privacy Intelligence Report: {name}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
     pdf.cell(0, 5, clean_pdf_text(f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
 
+    if synthesis:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, clean_pdf_text("INTELLIGENCE SYNTHESIS & RISK ANALYSIS"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.multi_cell(0, 4, clean_pdf_text(synthesis))
+        pdf.ln(5)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, clean_pdf_text("VERIFIED PAGES & FOOTPRINT DETAILS"), new_x="LMARGIN", new_y="NEXT")
     for item in verified_items:
-        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_font("Helvetica", "B", 10)
         pdf.cell(0, 6, clean_pdf_text(item['site']), new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 9)
         details = f"URL: {item['url']}\nSummary: {item['snippet']}\nQuery: {item.get('query_used', 'N/A')}\n"
@@ -287,11 +363,16 @@ def generate_pdf(verified_items, name):
         pdf.ln(2)
     return bytes(pdf.output())
 
-def generate_docx(verified_items, name):
+def generate_docx(verified_items, name, synthesis=""):
     doc = docx.Document()
-    doc.add_heading(f"IDkat Footprint Report: {name}", 0)
+    doc.add_heading(f"IDkat Media & Privacy Intelligence Report: {name}", 0)
     doc.add_paragraph(f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}")
 
+    if synthesis:
+        doc.add_heading("Intelligence Synthesis & Risk Analysis", level=1)
+        doc.add_paragraph(synthesis)
+
+    doc.add_heading("Verified Pages & Footprint Details", level=1)
     for item in verified_items:
         doc.add_heading(item['site'], level=2)
         doc.add_paragraph(f"URL: {item['url']}")
@@ -302,8 +383,14 @@ def generate_docx(verified_items, name):
     doc.save(bio)
     return bio.getvalue()
 
-def generate_txt(verified_items, name):
-    lines = [f"IDKAT FOOTPRINT REPORT: {name}", f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}", "="*50, ""]
+def generate_txt(verified_items, name, synthesis=""):
+    lines = [f"IDKAT MEDIA & PRIVACY INTELLIGENCE REPORT: {name}", f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}", "="*60, ""]
+    if synthesis:
+        lines.append("INTELLIGENCE SYNTHESIS & RISK ANALYSIS:")
+        lines.append(synthesis)
+        lines.append("\n" + "="*60 + "\n")
+
+    lines.append("VERIFIED PAGES & FOOTPRINT DETAILS:")
     for item in verified_items:
         lines.append(f"Site: {item['site']}")
         lines.append(f"URL: {item['url']}")
@@ -313,7 +400,7 @@ def generate_txt(verified_items, name):
     return "\n".join(lines).encode("utf-8")
 
 # ============================================================================
-# 4. STREAMLIT INTERFACE & HEADER
+# 4. STREAMLIT INTERFACE
 # ============================================================================
 st.markdown(
     f"""<style>
@@ -324,9 +411,9 @@ st.markdown(
 .idk-band .sub {{ color:{SAND}; font-style:normal; margin-top:6px; font-size:1.0rem; }}
 </style>
 <div class="idk-band">
-  <div class="eyebrow">Privacy & Footprint Tool</div>
+  <div class="eyebrow">Privacy & Media Intelligence Tool</div>
   <div class="title">🐾 IDkat</div>
-  <div class="sub">Find where your personal information appears online, review what's exposed, and export a report. All your data is deleted when you download.</div>
+  <div class="sub">Find where your personal information appears online, review what's exposed, and export a synthesized intelligence report. Save profile libraries to your account.</div>
 </div>""",
     unsafe_allow_html=True,
 )
@@ -345,15 +432,22 @@ if "search_terms" not in st.session_state:
     st.session_state.search_terms = []
 if "user_fullname" not in st.session_state:
     st.session_state.user_fullname = ""
+if "synthesis" not in st.session_state:
+    st.session_state.synthesis = ""
+if "selected_profile_id" not in st.session_state:
+    st.session_state.selected_profile_id = ""
 
 if st.session_state.username and not st.session_state.search_results:
-    db_state = load_user_state(st.session_state.username)
+    db_state = load_workspace(st.session_state.username)
     if db_state:
+        st.session_state.selected_profile_id = db_state.get("profile_id", "")
         st.session_state.user_fullname = db_state["fullname"]
         st.session_state.search_results = db_state["results"]
         st.session_state.confirmations = db_state["confirmations"]
         st.session_state.search_terms = db_state["terms"]
+        st.session_state.synthesis = db_state.get("synthesis", "")
 
+# Authentication View
 if not st.session_state.username:
     tab1, tab2 = st.tabs(["Sign In", "Create Account"])
     
@@ -396,28 +490,63 @@ if not st.session_state.username:
                     st.error("Please fill in both fields.")
     st.stop()
 
-top1, top2 = st.columns([3, 1])
-top1.markdown(f"Signed in as **{html.escape(st.session_state.username)}**")
-if top2.button("Log out"):
-    destroy_session()
-    st.session_state.username = None
-    st.session_state.search_results = []
-    st.rerun()
+# Account Sidebar & Profile Library
+with st.sidebar:
+    st.title("👤 Account")
+    st.write(f"Logged in: **{st.session_state.username}**")
+    
+    if st.button("Log out", width="stretch"):
+        destroy_session()
+        st.session_state.username = None
+        st.session_state.search_results = []
+        st.rerun()
+
+    st.divider()
+    st.subheader("📁 Profile Library")
+    saved_profiles = get_user_profiles(st.session_state.username)
+    
+    if saved_profiles:
+        for p in saved_profiles:
+            st.markdown(f"**{p['profile_name']}** ({p['fullname']})")
+            col_p1, col_p2 = st.columns([3, 1])
+            if col_p1.button("Load Profile", key=f"load_{p['profile_id']}"):
+                st.session_state.selected_profile_id = p["profile_id"]
+                st.session_state.user_fullname = p["fullname"]
+                st.session_state.search_results = []
+                st.session_state.confirmations = {}
+                st.session_state.synthesis = ""
+                st.rerun()
+            if col_p2.button("🗑️", key=f"del_{p['profile_id']}"):
+                delete_profile(p["profile_id"])
+                st.rerun()
+            st.markdown("---")
+    else:
+        st.caption("No saved profiles in your library yet.")
+
+    st.divider()
+    with st.expander("Danger Zone"):
+        if st.button("Delete My Account & All Data", type="primary"):
+            delete_entire_account(st.session_state.username)
+            st.session_state.username = None
+            st.session_state.search_results = []
+            st.rerun()
 
 api_key = str(secret("GEMINI_API_KEY", "") or "")
 model_name = str(secret("GEMINI_MODEL", DEFAULT_MODEL))
 
 # ============================================================================
-# SEARCH & RESULTS DASHBOARD
+# DASHBOARD WORKSPACE
 # ============================================================================
 if not st.session_state.search_results:
-    st.subheader("1. Start Your Search")
+    st.subheader("1. Start Your Search / Save Profile")
     with st.form("initial_search"):
+        profile_label = st.text_input("Profile Name (to save in your library)", value="My Primary Profile", placeholder="e.g. Personal Profile, Professional Alias")
         name = st.text_input("Full Name *", placeholder="e.g. Will Wright")
         locations = st.text_input("Cities / Towns lived in", placeholder="e.g. Geelong, Melbourne")
         workplaces = st.text_area("Workplaces / Companies / Schools", placeholder="e.g. Acme Media\nMonash University")
         handles = st.text_input("Social Media Handles / Usernames", placeholder="e.g. @willwright, @willwrightmedia")
         
+        save_to_lib = st.checkbox("Save this profile to my library for future runs", value=True)
         confirm = st.checkbox("I confirm I am searching for information about myself")
         start_btn = st.form_submit_button("Run 3-Pass Search", type="primary")
 
@@ -429,6 +558,17 @@ if not st.session_state.search_results:
             loc_list = [x.strip() for x in locations.split(",") if x.strip()]
             work_list = [x.strip() for x in workplaces.split("\n") if x.strip()]
             hand_list = [x.strip() for x in handles.split(",") if x.strip()]
+
+            if save_to_lib:
+                pid = save_profile(
+                    st.session_state.username,
+                    profile_label.strip() or "Saved Profile",
+                    name.strip(),
+                    locations.strip(),
+                    workplaces.strip(),
+                    handles.strip()
+                )
+                st.session_state.selected_profile_id = pid
 
             st.session_state.search_terms = [
                 {"term": t, "active": True, "type": "Location"} for t in loc_list
@@ -447,18 +587,20 @@ if not st.session_state.search_results:
                 model_name
             )
             st.session_state.search_results = results
-            save_user_state(
+            save_workspace(
                 st.session_state.username,
+                st.session_state.selected_profile_id,
                 st.session_state.user_fullname,
                 st.session_state.search_results,
                 st.session_state.confirmations,
                 st.session_state.search_terms,
+                st.session_state.synthesis,
             )
             st.rerun()
 
 else:
     st.subheader(f"Search Results ({len(st.session_state.search_results)} pages found)")
-    st.caption("Review candidate pages below. Click 'This is me' to include a page in your report.")
+    st.caption("Review candidate pages below. Click 'This is me' to include a page in your synthesized report.")
 
     verified = []
     excluded = 0
@@ -480,28 +622,58 @@ else:
                 c1, c2 = st.columns(2)
                 if c1.button("This is me", key=f"yes_{idx}"):
                     st.session_state.confirmations[item_id] = "yes"
-                    save_user_state(
+                    save_workspace(
                         st.session_state.username,
+                        st.session_state.selected_profile_id,
                         st.session_state.user_fullname,
                         st.session_state.search_results,
                         st.session_state.confirmations,
                         st.session_state.search_terms,
+                        st.session_state.synthesis,
                     )
                     st.rerun()
                 if c2.button("Not me", key=f"no_{idx}"):
                     st.session_state.confirmations[item_id] = "no"
-                    save_user_state(
+                    save_workspace(
                         st.session_state.username,
+                        st.session_state.selected_profile_id,
                         st.session_state.user_fullname,
                         st.session_state.search_results,
                         st.session_state.confirmations,
                         st.session_state.search_terms,
+                        st.session_state.synthesis,
                     )
                     st.rerun()
             st.markdown("---")
 
+    # Synthesis Section
     st.divider()
-    st.subheader("2. Refine Search")
+    st.subheader("2. Media & Privacy Intelligence Synthesis")
+    if verified:
+        if st.button("🧠 Synthesize Findings into Intelligence Report", type="primary"):
+            with st.spinner("Analyzing verified pages, evaluating risks, and writing recommendations..."):
+                st.session_state.synthesis = synthesize_report_intelligence(
+                    st.session_state.user_fullname, verified, api_key, model_name
+                )
+                save_workspace(
+                    st.session_state.username,
+                    st.session_state.selected_profile_id,
+                    st.session_state.user_fullname,
+                    st.session_state.search_results,
+                    st.session_state.confirmations,
+                    st.session_state.search_terms,
+                    st.session_state.synthesis,
+                )
+                st.rerun()
+
+        if st.session_state.synthesis:
+            st.markdown(st.session_state.synthesis)
+    else:
+        st.info("Mark at least one candidate page as 'This is me' above to synthesize your report.")
+
+    # Smart Search Refinement
+    st.divider()
+    st.subheader("3. Refine Search")
     st.caption("Tick or untick details below to refine your next single-pass search, or add custom terms.")
 
     selected_terms = []
@@ -520,12 +692,14 @@ else:
         if st.form_submit_button("Add Detail"):
             if new_term.strip():
                 st.session_state.search_terms.append({"term": new_term.strip(), "active": True, "type": "Custom"})
-                save_user_state(
+                save_workspace(
                     st.session_state.username,
+                    st.session_state.selected_profile_id,
                     st.session_state.user_fullname,
                     st.session_state.search_results,
                     st.session_state.confirmations,
                     st.session_state.search_terms,
+                    st.session_state.synthesis,
                 )
                 st.rerun()
 
@@ -534,27 +708,31 @@ else:
     with q_col1:
         if st.button("🔍 Check Business & ASIC Registers"):
             st.session_state.search_terms.append({"term": "ASIC business directorship register", "active": True, "type": "Corporate"})
-            save_user_state(
+            save_workspace(
                 st.session_state.username,
+                st.session_state.selected_profile_id,
                 st.session_state.user_fullname,
                 st.session_state.search_results,
                 st.session_state.confirmations,
                 st.session_state.search_terms,
+                st.session_state.synthesis,
             )
             st.rerun()
     with q_col2:
         if st.button("🔍 Check Website Registrations"):
             st.session_state.search_terms.append({"term": "domain WHOIS registration website owner", "active": True, "type": "Domain"})
-            save_user_state(
+            save_workspace(
                 st.session_state.username,
+                st.session_state.selected_profile_id,
                 st.session_state.user_fullname,
                 st.session_state.search_results,
                 st.session_state.confirmations,
                 st.session_state.search_terms,
+                st.session_state.synthesis,
             )
             st.rerun()
 
-    if st.button("🚀 Run 1-Pass Search Extension", type="primary"):
+    if st.button("🚀 Run 1-Pass Search Extension"):
         with st.spinner("Searching for additional pages..."):
             client = model_client(api_key)
             query = f'"{st.session_state.user_fullname}" ' + " ".join([f'"{t}"' for t in selected_terms])
@@ -569,12 +747,14 @@ else:
                     st.session_state.search_results.append(nr)
                     added_count += 1
             
-            save_user_state(
+            save_workspace(
                 st.session_state.username,
+                st.session_state.selected_profile_id,
                 st.session_state.user_fullname,
                 st.session_state.search_results,
                 st.session_state.confirmations,
                 st.session_state.search_terms,
+                st.session_state.synthesis,
             )
             if added_count > 0:
                 st.success(f"Search updated! Found {added_count} new candidate pages.")
@@ -584,35 +764,35 @@ else:
             st.rerun()
 
     st.divider()
-    st.subheader("3. Export & Delete Data")
+    st.subheader("4. Export Report")
     st.write(f"- Pages verified for report: **{len(verified)}**")
     st.write(f"- Pages excluded: **{excluded}**")
 
     fmt = st.selectbox("Select file format", ["PDF (.pdf)", "Word Document (.docx)", "Plain Text (.txt)"])
 
     if fmt == "PDF (.pdf)":
-        data = generate_pdf(verified, st.session_state.user_fullname)
-        fname = f"IDkat_{st.session_state.user_fullname.replace(' ', '_')}.pdf"
+        data = generate_pdf(verified, st.session_state.user_fullname, st.session_state.synthesis)
+        fname = f"IDkat_Intelligence_Report_{st.session_state.user_fullname.replace(' ', '_')}.pdf"
         mtype = "application/pdf"
     elif fmt == "Word Document (.docx)":
-        data = generate_docx(verified, st.session_state.user_fullname)
-        fname = f"IDkat_{st.session_state.user_fullname.replace(' ', '_')}.docx"
+        data = generate_docx(verified, st.session_state.user_fullname, st.session_state.synthesis)
+        fname = f"IDkat_Intelligence_Report_{st.session_state.user_fullname.replace(' ', '_')}.docx"
         mtype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     else:
-        data = generate_txt(verified, st.session_state.user_fullname)
-        fname = f"IDkat_{st.session_state.user_fullname.replace(' ', '_')}.txt"
+        data = generate_txt(verified, st.session_state.user_fullname, st.session_state.synthesis)
+        fname = f"IDkat_Intelligence_Report_{st.session_state.user_fullname.replace(' ', '_')}.txt"
         mtype = "text/plain"
 
     if st.download_button(
-        label=f"📥 Download {fmt} Report & Delete My Data",
+        label=f"📥 Download {fmt} Report & Clear Active Search",
         data=data,
         file_name=fname,
         mime=mtype,
         type="primary"
     ):
-        delete_user_permanently(st.session_state.username)
-        st.session_state.username = None
+        clear_workspace(st.session_state.username)
         st.session_state.search_results = []
         st.session_state.confirmations = {}
-        st.success("Report downloaded! All user details and search results permanently purged from IDkat.")
+        st.session_state.synthesis = ""
+        st.success("Report downloaded! Active search session cleared (your account and saved profiles remain in your library).")
         st.rerun()
