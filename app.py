@@ -16,7 +16,6 @@ import re
 import secrets as pysecrets
 import threading
 import time
-import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -57,14 +56,13 @@ def app_secret():
     return value.encode() if len(value) >= 32 else b""
 
 # ============================================================================
-# 1. MEMORY-ONLY STORE & PERSISTENT SESSION TOKENS
+# 1. IN-MEMORY AUTHENTICATION & STORE
 # ============================================================================
 @st.cache_resource
 def _store():
     return {
         "lock": threading.Lock(),
         "users": {},
-        "jobs": {},
         "sessions": {},
     }
 
@@ -80,11 +78,6 @@ def verify_password(password: str, salt_hex: str, pw_hash_hex: str) -> bool:
     salt = bytes.fromhex(salt_hex)
     _, new_hash = hash_password(password, salt)
     return hmac.compare_digest(new_hash, pw_hash_hex)
-
-def fingerprint(value):
-    return hmac.new(
-        app_secret() or b"idkat", str(value).strip().lower().encode(), "sha256"
-    ).hexdigest()[:24]
 
 def norm_url(url):
     if not url or not str(url).startswith("http"):
@@ -128,7 +121,7 @@ def destroy_session():
     st.query_params.clear()
 
 # ============================================================================
-# 2. SEARCH ENGINE EXECUTION
+# 2. RELIABLE SEARCH PASS EXECUTION
 # ============================================================================
 def execute_search_pass(client, model, query_str):
     config = types.GenerateContentConfig(
@@ -162,70 +155,47 @@ def execute_search_pass(client, model, query_str):
         pass
     return results
 
-def run_background_initial_search(job, username, name, locations, workplaces, handles, api_key, model):
-    try:
-        client = model_client(api_key)
-        all_found = []
-        seen_urls = set()
+def run_3_pass_search(name, locations, workplaces, handles, api_key, model):
+    client = model_client(api_key)
+    all_found = []
+    seen_urls = set()
 
-        job["progress"] = "Pass 1/3: Checking social profiles and handles..."
-        q1 = f'"{name}" ' + " ".join([f'"{h}"' for h in handles if h])
-        res1 = execute_search_pass(client, model, q1)
+    progress_bar = st.progress(0, text="Starting 3-Pass Search...")
 
-        job["progress"] = "Pass 2/3: Checking workplaces and business records..."
-        q2 = f'"{name}" ' + " ".join([f'"{w}"' for w in workplaces if w])
-        res2 = execute_search_pass(client, model, q2)
+    # Pass 1: Social Profiles & Handles
+    progress_bar.progress(20, text="Pass 1/3: Checking social profiles and handles...")
+    q1 = f'"{name}" ' + " ".join([f'"{h}"' for h in handles if h])
+    res1 = execute_search_pass(client, model, q1)
 
-        job["progress"] = "Pass 3/3: Checking cities and regional listings..."
-        q3 = f'"{name}" ' + " ".join([f'"{l}"' for l in locations if l])
-        res3 = execute_search_pass(client, model, q3)
+    # Pass 2: Workplaces & Companies
+    progress_bar.progress(50, text="Pass 2/3: Checking workplaces and business records...")
+    q2 = f'"{name}" ' + " ".join([f'"{w}"' for w in workplaces if w])
+    res2 = execute_search_pass(client, model, q2)
 
-        if not (res1 or res2 or res3):
-            job["progress"] = "Running fallback profile search..."
-            q_fallback = f'"{name}" online profile'
-            res3.extend(execute_search_pass(client, model, q_fallback))
+    # Pass 3: Locations & Regional Directories
+    progress_bar.progress(80, text="Pass 3/3: Checking cities and regional listings...")
+    q3 = f'"{name}" ' + " ".join([f'"{l}"' for l in locations if l])
+    res3 = execute_search_pass(client, model, q3)
 
-        for item in res1 + res2 + res3:
-            norm = norm_url(item["url"])
-            if norm and norm not in seen_urls:
-                seen_urls.add(norm)
-                all_found.append(item)
+    if not (res1 or res2 or res3):
+        progress_bar.progress(90, text="Running fallback profile search...")
+        q_fallback = f'"{name}" online profile'
+        res3.extend(execute_search_pass(client, model, q_fallback))
 
-        job["result"] = all_found
-        job["status"] = "done"
-    except Exception as e:
-        job["status"] = "failed"
-        job["error"] = str(e)
+    progress_bar.progress(100, text="Search Complete!")
+    time.sleep(0.5)
+    progress_bar.empty()
 
-def start_initial_search_thread(username, name, locations, workplaces, handles, api_key, model):
-    job = {
-        "id": uuid.uuid4().hex[:12],
-        "owner": fingerprint(username),
-        "status": "running",
-        "progress": "Starting 3-pass search...",
-        "started": time.time(),
-        "result": None,
-        "error": ""
-    }
+    for item in res1 + res2 + res3:
+        norm = norm_url(item["url"])
+        if norm and norm not in seen_urls:
+            seen_urls.add(norm)
+            all_found.append(item)
+
+    return all_found
+
+def delete_user_data(username):
     with STORE["lock"]:
-        STORE["jobs"][job["id"]] = job
-    threading.Thread(
-        target=run_background_initial_search,
-        args=(job, username, name, locations, workplaces, handles, api_key, model),
-        daemon=True
-    ).start()
-
-def get_active_job(username):
-    owner = fingerprint(username)
-    with STORE["lock"]:
-        jobs = [j for j in STORE["jobs"].values() if j["owner"] == owner]
-        return max(jobs, key=lambda x: x["started"]) if jobs else None
-
-def delete_user_session_and_data(username):
-    owner = fingerprint(username)
-    with STORE["lock"]:
-        for j_id in [j for j, job in STORE["jobs"].items() if job["owner"] == owner]:
-            del STORE["jobs"][j_id]
         if username.lower() in STORE["users"]:
             del STORE["users"][username.lower()]
     destroy_session()
@@ -344,8 +314,8 @@ if not st.session_state.username:
                             STORE["users"][u_clean] = {"salt": s, "pw_hash": h}
                             st.session_state.username = nu.strip()
                             create_session(nu.strip())
-                            st.success("Account created! Logging you in...")
-                            time.sleep(1)
+                            st.success("Account created!")
+                            time.sleep(0.5)
                             st.rerun()
                 else:
                     st.error("Please fill in both fields.")
@@ -362,18 +332,6 @@ if top2.button("Log out"):
 
 api_key = str(secret("GEMINI_API_KEY", "") or "")
 model_name = str(secret("GEMINI_MODEL", DEFAULT_MODEL))
-
-# Check background job state
-active_job = get_active_job(st.session_state.username)
-
-if active_job and active_job["status"] == "running":
-    st.info(f"⏳ **Search running:** {active_job['progress']}  \n*You can close or switch windows. The search runs on the server and will be ready when you return.*")
-    time.sleep(3)
-    st.rerun()
-
-if active_job and active_job["status"] == "done" and not st.session_state.search_results:
-    st.session_state.search_results = active_job["result"]
-    st.rerun()
 
 # ============================================================================
 # SEARCH & RESULTS DASHBOARD
@@ -406,8 +364,7 @@ if not st.session_state.search_results:
                 {"term": t, "active": True, "type": "Handle"} for t in hand_list
             ]
 
-            start_initial_search_thread(
-                st.session_state.username,
+            results = run_3_pass_search(
                 name.strip(),
                 loc_list,
                 work_list,
@@ -415,6 +372,7 @@ if not st.session_state.search_results:
                 api_key,
                 model_name
             )
+            st.session_state.search_results = results
             st.rerun()
 
 else:
@@ -501,7 +459,7 @@ else:
                 st.success(f"Search updated! Found {added_count} new candidate pages.")
             else:
                 st.info("No additional new pages found with those terms.")
-            time.sleep(1)
+            time.sleep(0.5)
             st.rerun()
 
     # Export & Complete Memory Wipe
@@ -532,7 +490,7 @@ else:
         mime=mtype,
         type="primary"
     ):
-        delete_user_session_and_data(st.session_state.username)
+        delete_user_data(st.session_state.username)
         st.session_state.username = None
         st.session_state.search_results = []
         st.session_state.confirmations = {}
