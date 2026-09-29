@@ -58,7 +58,7 @@ def app_secret():
     return value.encode() if len(value) >= 32 else b""
 
 # ============================================================================
-# 1. DATABASE STORAGE (PERSISTS LOGINS & RESULTS ACROSS REBOOTS)
+# 1. DATABASE STORAGE
 # ============================================================================
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -183,7 +183,7 @@ def delete_user_permanently(username):
     destroy_session()
 
 # ============================================================================
-# 2. RELIABLE SEARCH EXECUTION
+# 2. SEARCH ENGINE EXECUTION
 # ============================================================================
 def execute_search_pass(client, model, query_str):
     config = types.GenerateContentConfig(
@@ -224,17 +224,14 @@ def run_3_pass_search(name, locations, workplaces, handles, api_key, model):
 
     progress_bar = st.progress(0, text="Starting 3-Pass Search...")
 
-    # Pass 1: Social Profiles
     progress_bar.progress(20, text="Pass 1/3: Checking social profiles and handles...")
     q1 = f'"{name}" ' + " ".join([f'"{h}"' for h in handles if h])
     res1 = execute_search_pass(client, model, q1)
 
-    # Pass 2: Workplaces
     progress_bar.progress(50, text="Pass 2/3: Checking workplaces and business records...")
     q2 = f'"{name}" ' + " ".join([f'"{w}"' for w in workplaces if w])
     res2 = execute_search_pass(client, model, q2)
 
-    # Pass 3: Locations
     progress_bar.progress(80, text="Pass 3/3: Checking cities and regional listings...")
     q3 = f'"{name}" ' + " ".join([f'"{l}"' for l in locations if l])
     res3 = execute_search_pass(client, model, q3)
@@ -257,22 +254,36 @@ def run_3_pass_search(name, locations, workplaces, handles, api_key, model):
     return all_found
 
 # ============================================================================
-# 3. REPORT EXPORTERS
+# 3. UNICODE SAFE REPORT EXPORTERS
 # ============================================================================
+def clean_pdf_text(text):
+    """Sanitizes text to prevent FPDFUnicodeEncodingException on standard Latin-1 canvas."""
+    if not text:
+        return ""
+    replacements = {
+        "“": '"', "”": '"', "‘": "'", "’": "'",
+        "—": "-", "–": "-", "…": "...", "•": "*",
+        "\u200b": "", "\xa0": " "
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
 def generate_pdf(verified_items, name):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, f"IDkat Footprint Report: {name}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, clean_pdf_text(f"IDkat Footprint Report: {name}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 5, f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, clean_pdf_text(f"Generated: {datetime.datetime.now().strftime('%d %b %Y %H:%M')}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
 
     for item in verified_items:
         pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 6, item['site'], new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, clean_pdf_text(item['site']), new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 9)
-        pdf.multi_cell(0, 4, f"URL: {item['url']}\nSummary: {item['snippet']}\nQuery: {item.get('query_used', 'N/A')}\n")
+        details = f"URL: {item['url']}\nSummary: {item['snippet']}\nQuery: {item.get('query_used', 'N/A')}\n"
+        pdf.multi_cell(0, 4, clean_pdf_text(details))
         pdf.ln(2)
     return bytes(pdf.output())
 
@@ -320,7 +331,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Restore session from persistent DB
 current_user = get_session_user()
 if current_user and "username" not in st.session_state:
     st.session_state.username = current_user
@@ -336,7 +346,6 @@ if "search_terms" not in st.session_state:
 if "user_fullname" not in st.session_state:
     st.session_state.user_fullname = ""
 
-# Load state if logged in but state empty
 if st.session_state.username and not st.session_state.search_results:
     db_state = load_user_state(st.session_state.username)
     if db_state:
@@ -345,7 +354,6 @@ if st.session_state.username and not st.session_state.search_results:
         st.session_state.confirmations = db_state["confirmations"]
         st.session_state.search_terms = db_state["terms"]
 
-# Authentication View
 if not st.session_state.username:
     tab1, tab2 = st.tabs(["Sign In", "Create Account"])
     
@@ -362,7 +370,7 @@ if not st.session_state.username:
                     create_session(user_row["username"])
                     st.rerun()
                 else:
-                    st.error("Invalid username or password. Please check your details or create a new account.")
+                    st.error("Invalid username or password.")
 
     with tab2:
         with st.form("signup"):
@@ -374,7 +382,7 @@ if not st.session_state.username:
                     with get_db() as conn:
                         existing = conn.execute("SELECT username FROM users WHERE username = ?", (u_clean,)).fetchone()
                         if existing:
-                            st.error("Username already taken. Please choose another.")
+                            st.error("Username taken. Please choose another.")
                         else:
                             s, h = hash_password(np)
                             conn.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (u_clean, s, h, time.time()))
@@ -388,7 +396,6 @@ if not st.session_state.username:
                     st.error("Please fill in both fields.")
     st.stop()
 
-# Header Navigation
 top1, top2 = st.columns([3, 1])
 top1.markdown(f"Signed in as **{html.escape(st.session_state.username)}**")
 if top2.button("Log out"):
@@ -450,7 +457,6 @@ if not st.session_state.search_results:
             st.rerun()
 
 else:
-    # Interactive Results Dashboard
     st.subheader(f"Search Results ({len(st.session_state.search_results)} pages found)")
     st.caption("Review candidate pages below. Click 'This is me' to include a page in your report.")
 
@@ -494,7 +500,6 @@ else:
                     st.rerun()
             st.markdown("---")
 
-    # Smart Search Refinement
     st.divider()
     st.subheader("2. Refine Search")
     st.caption("Tick or untick details below to refine your next single-pass search, or add custom terms.")
@@ -578,7 +583,6 @@ else:
             time.sleep(0.5)
             st.rerun()
 
-    # Export & Complete Memory Wipe
     st.divider()
     st.subheader("3. Export & Delete Data")
     st.write(f"- Pages verified for report: **{len(verified)}**")
