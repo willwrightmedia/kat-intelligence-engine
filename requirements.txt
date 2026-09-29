@@ -1,7 +1,0 @@
-streamlit>=1.64
-google-genai>=2.25.0
-pydantic>=2
-requests
-fpdf2
-python-docx
-matplotlib
